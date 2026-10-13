@@ -59,6 +59,18 @@ python -m pip install -r requirements-gpu.txt
 国内网络可在 pip 命令末尾加 `--index-url https://pypi.tuna.tsinghua.edu.cn/simple`。
 仅做 CPU 检查时，安装 `requirements.txt`，然后运行 `python scripts/check_environment.py`。
 
+## 实时可视化
+
+逐帧推理可直接用 ModernGL + GLFW 查看器显示，无需 Blender 或 PC2 文件：
+
+```bash
+.venv/bin/python -m pip install -r requirements-render.txt
+.venv/bin/python scripts/view_realtime.py --xla
+```
+
+实时播放、键鼠操作及性能测试方法见 [scripts/BENCHMARK.md](scripts/BENCHMARK.md#moderngl--glfw-实时渲染)。
+需要可用的图形会话；CUDA 可用不代表 OpenGL 使用硬件加速，启动时会输出 renderer。
+
 ## Blender 可视化
 
 项目本地安装的 Blender 3.0.1 位于 `.tools/blender-3.0.1-linux-x64/`，使用其自带 Python，无需在 Conda 中安装 `bpy`。

@@ -58,9 +58,28 @@ class StreamingNCS(tf.Module):
 
     @tf.function(reduce_retracing=True)
     def step(self, poses, trans):
+        """Return cloth and hidden, preserving the original streaming API."""
+        return self._step(poses, trans, include_body=False)
+
+    @tf.function(reduce_retracing=True)
+    def step_with_body(self, poses, trans):
+        """Return (body, cloth, hidden), reusing the full-skeleton FK matrices."""
+        return self._step(poses, trans, include_body=True)
+
+    @tf.function(reduce_retracing=True)
+    def step_for_render(self, poses, trans):
+        """Return (cloth, full bone matrices, hidden) for renderer-side body LBS."""
+        return self._step(poses, trans, include_body=False, return_matrices=True)
+
+    def _step(self, poses, trans, include_body, return_matrices=False):
         tf.debugging.assert_equal(self.initialized, True, message="Call reset() before step()")
         tf.debugging.assert_equal(tf.shape(poses)[1], 1, message="step() accepts one frame")
-        x, j, matrices, inverse = self.spatial(poses, trans)
+        x, j, full_matrices, inverse = self.model.call_spatial_inputs(poses, trans)
+        indices = self.model.body.input_joints
+        x = tf.gather(x, indices, axis=-2)
+        j = tf.gather(j, indices, axis=-2)
+        matrices = tf.gather(full_matrices, indices, axis=-3)
+        inverse = tf.gather(inverse, indices, axis=-3)
         dt = self.model.config.time_step
         dx = (x - self.previous_x) / dt
         # Match the original repeated-difference order to minimize rounding drift.
@@ -73,4 +92,9 @@ class StreamingNCS(tf.Module):
         self.previous_j.assign(j)
         self.previous_x.assign(x)
         self.hidden.assign(hidden)
+        if return_matrices:
+            return cloth, full_matrices, hidden
+        if include_body:
+            body = self.model.lbs_body(self.model.body.vertices, full_matrices)
+            return body, cloth, hidden
         return cloth, hidden
