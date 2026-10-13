@@ -2,10 +2,66 @@
 
 import unittest
 import os
+from threading import Event
 
 import numpy as np
 
 from realtime_renderer import Renderer, camera_matrix, vertex_normals, normal_adjacency, is_software_renderer
+from view_realtime import FramePrefetch
+
+
+class PrefetchTests(unittest.TestCase):
+    def test_serial_order_and_single_frame_bound(self):
+        history = []
+        def compute(index):
+            history.append(index)
+            return index * 2
+        runner = FramePrefetch(compute)
+        try:
+            runner.prefetch(0)
+            with self.assertRaises(RuntimeError):
+                runner.prefetch(1)
+            with self.assertRaises(RuntimeError):
+                runner.take(1)
+            self.assertEqual(runner.take(0), 0)
+            runner.prefetch(1)
+            self.assertEqual(runner.take(1), 2)
+            runner.prefetch(2)
+            runner.discard()
+            self.assertEqual(runner.take(0), 0)
+            self.assertEqual(history, [0, 1, 2, 0])
+        finally:
+            runner.close()
+
+    def test_discard_drains_running_inference_before_reset(self):
+        entered, release = Event(), Event()
+        history = []
+        def compute(index):
+            entered.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError('Test timed out')
+            history.append(index)
+        runner = FramePrefetch(compute)
+        try:
+            runner.prefetch(1)
+            self.assertTrue(entered.wait(timeout=2))
+            release.set()
+            runner.discard()
+            history.append('reset')
+            self.assertEqual(history, [1, 'reset'])
+        finally:
+            release.set()
+            runner.close()
+
+    def test_worker_error_propagates(self):
+        def compute(index):
+            raise ValueError('inference failed')
+        runner = FramePrefetch(compute)
+        try:
+            with self.assertRaisesRegex(ValueError, 'inference failed'):
+                runner.take(0)
+        finally:
+            runner.close()
 
 
 class GeometryTests(unittest.TestCase):

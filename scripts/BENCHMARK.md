@@ -66,6 +66,10 @@ with tf.device('/GPU:0'):
 模型始终按配置 `data.fps` 的时间步推进，首帧和循环边界重置历史及 GRU。
 默认使用 GPU 硬件渲染、GPU 法线、OpenGL 人体蒙皮和 XLA，不限速、不限总帧数，
 关闭垂直同步，循环推理并绘制每帧，直到 Esc/关闭窗口。
+benchmark 模式默认开启单帧预取：一个工作线程顺序执行下一帧推理，
+主线程执行当前帧的 OpenGL 上传、绘制和交换。最多预取一帧，不跳过中间结果。
+下一帧在当前帧绘制命令提交后启动，与交换等待重叠，减少 Python GIL 争用。
+动画循环重置直接恢复首帧的设备缓存，不重复计算初始骨骼特征。
 动画会加速播放，但模型差分时间步保持不变。
 按实际节奏播放使用 `--mode realtime`：处理落后时降低播放速度，不跳过姿态。
 
@@ -86,6 +90,10 @@ R 重播，W 切换线框，Esc 退出。视口左上角显示滚动窗口 FPS�
   --mode benchmark --xla --warmup 50 --iterations 1000 \
   --json results/viewer_xla_benchmark.json
 
+# 同一渲染路径关闭推理预取，作串行对照（保留缓冲/重置优化）
+.venv/bin/python scripts/view_realtime.py --no-pipeline --iterations 1000 \
+  --json results/viewer_serial_benchmark.json
+
 # 定时实时播放，结束时保存报告；启动、编译和预热不计入 300 秒
 .venv/bin/python scripts/view_realtime.py --mode realtime --duration 300 \
   --json results/viewer_realtime.json
@@ -96,6 +104,7 @@ R 重播，W 切换线框，Esc 退出。视口左上角显示滚动窗口 FPS�
 
 每次启动会校验最多 32 帧：人体/衣服与原始 `model.predict()` 对齐，
 新旧单帧接口的衣服及 hidden 对齐，并验证重置可复现。
+启用流水线时额外比较工作线程与串行输出，覆盖动画循环边界。
 容差为 `rtol=1e-4, atol=1e-5`，默认关闭 TF32。校验失败不进入渲染。
 `--xla` 编译失败直接报错，不自动改变测试路径。
 XLA 默认开启，`--no-xla` 可以关闭。`--iterations 0` 表示不限总帧数（默认）；
@@ -105,25 +114,37 @@ XLA 默认开启，`--no-xla` 可以关闭。`--iterations 0` 表示不限总帧
 
 不限速模式关闭垂直同步，每个推理结果都提交绘制；驱动可能覆盖同步请求。
 默认窗口为 1280×720，可用 `--width` / `--height` 修改。CSV 保留每帧实际绘制尺寸。
-测量阶段不包括预热、启动和循环重置；报告单独记录模型加载、首次推理（含编译）
+测量阶段不包括预热和启动；报告单独记录模型加载、首次推理（含编译）
 和窗口初始化耗时。
 
 | 字段 | 含义 |
 | --- | --- |
 | `input_upload_ms` | 选择设备常驻输入的 CPU 开销；输入上传在测量前完成 |
 | `inference_readback_ms` | 前处理、网络、衣服蒙皮，以及衣服顶点/骨骼矩阵 CPU 读回；TensorFlow 人体路径还包含人体蒙皮及读回 |
+| `inference_wait_ms` | 渲染线程取得当前帧的等待耗时；流水线中通常远小于实际推理耗时 |
+| `clip_reset_ms` | 此帧推理前恢复初始缓存的耗时，包含于等待区间或与当前帧绘制重叠 |
+| `prefetch_age_ms` | 渲染线程取出结果时，结果完成至今的时间 |
 | `normals_ms` | 有限值检查；选用 CPU 法线时还包含法线计算 |
 | `vertex_upload_cpu_ms` | 顶点打包和 OpenGL 上传调用的 CPU 耗时 |
 | `mesh_update_submit_cpu_ms` | GPU 人体蒙皮/法线提交的 CPU 耗时 |
 | `gpu_mesh_update_ms` | GPU 人体蒙皮（启用时）与顶点法线的 GPU 耗时 |
 | `draw_submit_cpu_ms` | 清屏、绘制提交及时间查询的 CPU 耗时 |
 | `gpu_draw_ms` | OpenGL 时间查询，覆盖清屏与绘制，不含顶点上传和显示 |
+| `prefetch_submit_ms` | 提交下一帧推理任务的 CPU 耗时 |
+| `event_poll_ms` | 当前更新前一次窗口事件处理耗时，在 processing 区间之外 |
+| `query_collect_ms` | 当前帧交换后收集较早 GPU 查询的 CPU 耗时，在 processing 区间之外 |
 | `swap_ms` | 交换缓冲调用耗时，可能包含垂直同步等待 |
-| `processing_ms` | 输入创建至交换缓冲返回，不含主动播放等待、重置和延迟读取查询 |
+| `processing_ms` | 渲染线程开始取得当前帧至交换缓冲返回，包含推理/重置等待，不含主动播放等待和延迟读取查询 |
+| `inference_to_swap_ms` | 当前帧实际推理开始至交换缓冲返回，反映预取带来的结果等待时间 |
 | `update_interval_ms` | 相邻动画帧交换缓冲返回之间的间隔，包含等待、暂停和重置 |
 
 GPU 查询延后至少四帧读取，结束时收集尾部结果。CPU 与 GPU 阶段可以重叠，
 各字段不可直接相加。整帧统计包含交换缓冲，但交换完成不代表屏幕实际呈现。
+流水线中的 `inference_readback_ms` 与当前/前一帧渲染重叠，不能加到
+`processing_ms` 上；渲染线程分段计时使用 `inference_wait_ms`。
+吞吐量提升不等于响应延迟等比例下降，应同时查看 `inference_to_swap_ms`。
+`--mode realtime` 默认使用串行路径，避免提前推进姿态；暂停保留至多一个预取结果，
+重播会等待在途推理完成后丢弃旧结果，再恢复首帧状态。
 窗口最小化时没有绘制查询，该帧 `gpu_draw_ms` 为空。
 JSON 包含逐帧样本、各耗时的 mean/P50/P95/P99、处理吞吐量、
 超过模型帧预算的比例、显卡及 OpenGL renderer 信息。
@@ -157,3 +178,29 @@ WSL 下需要可用的 WSLg/X11/Wayland 会话。查看启动输出中的 `OpenG
 最高性能以实际 FPS 和完整链路延迟评估。单角色时序推理、CPU/GPU 传输、
 驱动调度和桌面合成都可能成为瓶颈，取消限帧不能保证 GPU 占用 100%。
 增加无关绘制工作虽能提高占用率，却不会提高每帧推理吞吐量。
+
+### 2026-10-13 优化测量
+
+RTX 3060 Ti、WSL Mesa D3D12、1280×720、同一 19 帧动作循环、XLA 开启。
+缓冲使用 `STATIC_DRAW` 提示（仍允许逐帧写入及 compute shader 更新），
+在此环境中比 `DYNAMIC_DRAW` 显著减少上传和 GPU 访问开销。
+仅保留所需的 SSBO、顶点读取与缓冲读回屏障，避免全类别内存屏障。
+
+| 指标 | 优化前 | 缓冲与流水线优化后 |
+| --- | ---: | ---: |
+| 会话实际更新率 | 98.97 FPS | 178.74 FPS |
+| 每帧上传 CPU 耗时 | 2.013 ms | 0.054 ms |
+| 渲染线程等待推理 | 约 1.85 ms | 0.014 ms |
+| GPU 人体蒙皮与法线 | 0.661 ms | 0.057 ms |
+| 交换阶段 | 4.274 ms | 3.967 ms |
+
+优化后 1000 帧，工作线程与串行输出最大误差为 0；优化前为 20 秒、1980 帧样本。
+同样使用新缓冲和缓存重置、关闭流水线的 15 秒对照为 143.03 FPS。
+最终流水线 15 秒复核为 180.50 FPS；推理开始至交换完成平均 9.39 ms，
+因此吞吐量收益不应表述为同等比例的响应延迟收益。
+GPU 绘制未跳过、窗口分辨率未降低。
+交换前插入 `glFinish` 的独立诊断显示：约 1.65 ms 是 GPU/驱动完成等待，
+之后交换仍约 2.64 ms。原生 Wayland 对照未显著提升性能。
+这些测试表明交换时间同时包含队列完成及呈现路径开销，
+尚不能把后半部分完全归因于 WSL 桌面合成器。
+`glFinish` 仅用于诊断，不保留在正常帧循环中。

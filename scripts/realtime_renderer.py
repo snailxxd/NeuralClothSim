@@ -210,7 +210,10 @@ class Renderer:
             self.meshes = []
             for vertices, faces, color in ((body, body_faces, (0.65, 0.65, 0.65)),
                                             (cloth, cloth_faces, (0.25, 0.45, 0.95))):
-                buffer = self.ctx.buffer(reserve=len(vertices) * 6 * 4, dynamic=True)
+                # STATIC_DRAW is a placement hint, not immutable storage.
+                # On tested Mesa D3D12 this hint is much cheaper than
+                # DYNAMIC_DRAW for uploads and compute accesses.
+                buffer = self.ctx.buffer(reserve=len(vertices) * 6 * 4)
                 indices = self.ctx.buffer(np.asarray(faces, dtype='u4').tobytes())
                 vao = self.ctx.vertex_array(self.program,
                     [(buffer, '3f 3f', 'position', 'normal')], indices)
@@ -222,14 +225,14 @@ class Renderer:
                     adjacent_buffer = self.ctx.buffer(adjacent.tobytes())
                     self.resources.extend([offsets_buffer, adjacent_buffer])
                     self.normal_buffers.append((indices, offsets_buffer, adjacent_buffer, len(vertices)))
-                    positions = self.ctx.buffer(reserve=len(vertices) * 3 * 4, dynamic=True)
+                    positions = self.ctx.buffer(reserve=len(vertices) * 3 * 4)
                     self.position_buffers.append(positions)
                     self.resources.append(positions)
             if body_rest is not None:
                 self.skin_program = self.ctx.compute_shader(SKIN_SHADER)
                 rest = self.ctx.buffer(np.asarray(body_rest, dtype='f4').tobytes())
                 weights = self.ctx.buffer(np.asarray(body_weights, dtype='f4').tobytes())
-                matrices = self.ctx.buffer(reserve=body_weights.shape[1] * 12 * 4, dynamic=True)
+                matrices = self.ctx.buffer(reserve=body_weights.shape[1] * 12 * 4)
                 self.skin_buffers = (rest, weights, matrices)
                 self.skin_program['vertex_count'].value = len(body_rest)
                 self.skin_program['joint_count'].value = body_weights.shape[1]
@@ -262,7 +265,7 @@ class Renderer:
                 out vec4 frag_color;
                 void main() { frag_color=vec4(color, 1); }
                 ''')
-            self.hud_buffer = self.ctx.buffer(reserve=65536, dynamic=True)
+            self.hud_buffer = self.ctx.buffer(reserve=65536)
             self.hud_vao = self.ctx.vertex_array(self.hud_program,
                                                 [(self.hud_buffer, '2f', 'position')])
             self.resources.extend([self.hud_program, self.hud_buffer, self.hud_vao])
@@ -338,7 +341,7 @@ class Renderer:
                 for binding, buffer in enumerate((self.meshes[0][0], *self.skin_buffers)):
                     buffer.bind_to_storage_buffer(binding)
                 self.skin_program.run(group_x=(self.normal_buffers[0][3] + 127) // 128)
-                self.ctx.memory_barrier()
+                self.ctx.memory_barrier(self.gl.SHADER_STORAGE_BARRIER_BIT)
             for index, (mesh, (faces, offsets, adjacent, count)) in enumerate(zip(self.meshes, self.normal_buffers)):
                 for binding, buffer in enumerate((mesh[0], faces, offsets, adjacent)):
                     buffer.bind_to_storage_buffer(binding)
@@ -346,7 +349,8 @@ class Renderer:
                 self.normal_program['use_input'].value = not (index == 0 and self.skin_pending)
                 self.normal_program['vertex_count'].value = count
                 self.normal_program.run(group_x=(count + 127) // 128)
-            self.ctx.memory_barrier()
+            self.ctx.memory_barrier(self.gl.VERTEX_ATTRIB_ARRAY_BARRIER_BIT |
+                                    self.gl.BUFFER_UPDATE_BARRIER_BIT)
         finally:
             if query:
                 query.__exit__(None, None, None)
