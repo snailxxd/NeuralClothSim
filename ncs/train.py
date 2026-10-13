@@ -1,7 +1,11 @@
 import os
 import sys
 import argparse
-from shutil import rmtree
+import logging
+
+VERBOSE = "--verbose" in sys.argv
+# Keep native ERROR messages; INFO/WARNING startup diagnostics are optional.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "0" if VERBOSE else "2")
 import tensorflow as tf
 
 from model.ncs import NCS
@@ -10,27 +14,56 @@ from utils.config import MainConfig
 from global_vars import LOGS_DIR, CHECKPOINTS_DIR
 
 
+class TrainingLogFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        # These are expected for this architecture and full-model checkpoints.
+        return not (
+            message.startswith("Model's `__init__()` arguments contain non-serializable objects.")
+            or (message.startswith("Layer dyn_enc/gru ") and "generic GPU kernel" in message)
+        )
+
+
+if not VERBOSE:
+    tf.get_logger().addFilter(TrainingLogFilter())
+
+
 def make_model(config):
     model = NCS(config)
     print("Building model...")
     model.build(input_shape=config.input_shape)
-    model.summary()
+    if VERBOSE:
+        model.summary()
     print("Compiling model...")
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
+    # The model trains eagerly for SciPy collision detection. Avoid compiling
+    # an XLA optimizer update for each differently shaped parameter tensor.
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=config.learning_rate, jit_compile=False
+    )
     model.compile(optimizer=optimizer)
     if config.experiment.checkpoint is not None:
+        # Create Adam slots before restoring to recover its complete state.
+        optimizer.build(model.trainable_variables)
         checkpoint_path = os.path.join(CHECKPOINTS_DIR, config.experiment.checkpoint)
         model.load_weights(checkpoint_path)
     return model
 
 
 def main(config):
-    # Remove previous runs logs and checkpoints for this experiment
+    initial_epoch = getattr(config.experiment, "initial_epoch", 0)
+    if not isinstance(initial_epoch, int) or not 0 <= initial_epoch <= config.experiment.epochs:
+        raise ValueError("initial_epoch must be an integer between 0 and epochs")
+    if initial_epoch and config.experiment.checkpoint is None:
+        raise ValueError("initial_epoch requires a checkpoint to resume from")
+    # Avoid overwriting artifacts from an existing experiment.
     log_dir = os.path.join(LOGS_DIR, config.name)
     checkpoint_dir = os.path.join(CHECKPOINTS_DIR, config.name)
-    if os.path.isdir(log_dir) or os.path.isdir(checkpoint_dir):
-        print(f"There already are logs/checkpoints for an experiment with the same name. Experiment name: {config.name}")
-        print("Please remove or rename the logs/checkpoints. Alternatively, rename the experiment (JSON file name).")
+    existing_dirs = [path for path in (log_dir, checkpoint_dir) if os.path.isdir(path)]
+    if existing_dirs:
+        print(f"Experiment '{config.name}' cannot start because these output directories already exist:")
+        for path in existing_dirs:
+            print(f"  {path}")
+        print("Rename/archive the listed directories, or use a different config filename.")
         return
 
     print("Initializing model...")
@@ -46,10 +79,14 @@ def main(config):
     validation_data = Data(config, mode="validation")
 
     print("Training...")
+    if config.experiment.checkpoint is not None:
+        print(f"Loaded checkpoint '{config.experiment.checkpoint}'; starting at epoch {initial_epoch + 1}.")
     model.fit(
         data,
+        verbose=1 if VERBOSE else 2,
         validation_data=validation_data,
         epochs=config.experiment.epochs,
+        initial_epoch=initial_epoch,
         callbacks=[
             tf.keras.callbacks.TensorBoard(
                 log_dir=log_dir,
@@ -68,6 +105,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--gpu_id", type=str, required=True)
+    parser.add_argument("--verbose", action="store_true", help="Show detailed TensorFlow logs, model summary and batch progress")
     opts = parser.parse_args()
 
     # Set GPU

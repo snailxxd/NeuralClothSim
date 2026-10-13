@@ -1,0 +1,8 @@
+.venv/
+.tools/
+__pycache__/
+*.py[cod]
+logs/
+checkpoints/
+results/
+tmp/

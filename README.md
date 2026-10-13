@@ -14,6 +14,8 @@
 
 ## Run the code
 
+Environment setup (Linux / WSL2): [ENVIRONMENT.md](ENVIRONMENT.md).
+
 ### Train
 
 To train a model go to `ncs/` and run:

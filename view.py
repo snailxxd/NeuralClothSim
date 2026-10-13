@@ -1,6 +1,7 @@
 import os
 import sys
 import traceback
+from math import radians
 
 sys.path.append(".")
 sys.path.append("ncs")
@@ -10,7 +11,7 @@ from ncs.global_vars import BODY_DIR, RESULTS_DIR, ROOT_DIR
 from blender.utils import clean_scene, load_object, mesh_cache_modifier
 
 
-def main(config, loc=(0, 0, 0), rot=(0, 0, 0)):
+def main(config, loc=(0, 0, 0), rot=(radians(90), 0, 0)):
     # Load OBJs
     body_obj = os.path.join(BODY_DIR, config.body.model, "body.obj")
     body_pc2 = os.path.join(RESULTS_DIR, config.name, "body.pc2")
@@ -42,7 +43,7 @@ if __name__ == "__main__":
     for i, config in enumerate(configs):
         try:
             config = MainConfig(config)
-            main(config, loc=(i, 0, 0), rot=(0, 0, 0))
+            main(config, loc=(i, 0, 0))
         except:
             print("Could not load predictions for: ", config)
             print("")

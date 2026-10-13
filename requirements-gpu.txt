@@ -1,0 +1,3 @@
+-r requirements.txt
+# Linux / WSL2: CUDA 12.2 and cuDNN 8.9 libraries, without a system CUDA toolkit.
+tensorflow[and-cuda]==2.15.1

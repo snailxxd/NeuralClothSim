@@ -248,7 +248,8 @@ class NCS(tf.keras.Model):
         garment = self.lbs_cloth(unskinned, matrices[:, -3:])
         return body, garment, unskinned[:, -1]
 
-    def call_inputs(self, poses, trans):
+    def call_spatial_inputs(self, poses, trans):
+        """Compute per-frame quantities, without temporal differences."""
         # Compute local rotation matrices
         rotations = self.rot(poses)
         # Compute global transformation matrices
@@ -266,6 +267,10 @@ class NCS(tf.keras.Model):
         X = tf.concat((X, Z), axis=-1)
         # Compute joint locations
         J = self.skeleton(matrices)
+        return X, J, matrices, matrices_inv
+
+    def call_inputs(self, poses, trans):
+        X, J, matrices, matrices_inv = self.call_spatial_inputs(poses, trans)
         # Compute joint temporal derivatives
         dX = compute_nth_derivative(X, 1, self.config.time_step)[:, 1:]
         dJ = compute_nth_derivative(J, 2, self.config.time_step)

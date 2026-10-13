@@ -103,8 +103,20 @@ def slerp(q0, q1, r):
     dot = np.clip(dot, -1, 1)
     omega = np.arccos(dot)
     sin_omega = np.sin(omega)
-    w0 = np.where(sin_omega, np.sin((1 - r) * omega) / sin_omega, 1 - r)
-    w1 = np.where(sin_omega, np.sin(r * omega) / sin_omega, r)
+    weight_shape = np.broadcast_shapes(r.shape, omega.shape)
+    weight_dtype = np.result_type(omega, r, np.float32)
+    # np.where evaluates both branches, including divisions by zero. Divide
+    # only for nonzero angles and retain linear interpolation otherwise.
+    w0 = np.divide(
+        np.sin((1 - r) * omega), sin_omega,
+        out=np.broadcast_to(1 - r, weight_shape).astype(weight_dtype, copy=True),
+        where=sin_omega != 0,
+    )
+    w1 = np.divide(
+        np.sin(r * omega), sin_omega,
+        out=np.broadcast_to(r, weight_shape).astype(weight_dtype, copy=True),
+        where=sin_omega != 0,
+    )
     return w0 * q0 + w1 * q1
 
 
