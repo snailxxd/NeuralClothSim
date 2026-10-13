@@ -119,26 +119,6 @@ void main() {
 }
 '''
 
-GLYPHS = {
-    '0': ['01110','10001','10011','10101','11001','10001','01110'],
-    '1': ['00100','01100','00100','00100','00100','00100','01110'],
-    '2': ['01110','10001','00001','00010','00100','01000','11111'],
-    '3': ['11110','00001','00001','01110','00001','00001','11110'],
-    '4': ['00010','00110','01010','10010','11111','00010','00010'],
-    '5': ['11111','10000','10000','11110','00001','00001','11110'],
-    '6': ['01110','10000','10000','11110','10001','10001','01110'],
-    '7': ['11111','00001','00010','00100','01000','01000','01000'],
-    '8': ['01110','10001','10001','01110','10001','10001','01110'],
-    '9': ['01110','10001','10001','01111','00001','00001','01110'],
-    'F': ['11111','10000','10000','11110','10000','10000','10000'],
-    'P': ['11110','10001','10001','11110','10000','10000','10000'],
-    'S': ['01111','10000','10000','01110','00001','00001','11110'],
-    ':': ['00000','00100','00100','00000','00100','00100','00000'],
-    '.': ['00000','00000','00000','00000','00000','00100','00100'],
-    '-': ['00000','00000','00000','11111','00000','00000','00000'],
-}
-
-
 def normal_adjacency(faces, vertex_count):
     indices = np.asarray(faces, dtype='u4').ravel()
     order = np.argsort(indices, kind='stable')
@@ -170,13 +150,18 @@ class GLFWLoader:
 
 class Renderer:
     def __init__(self, body, cloth, body_faces, cloth_faces, width, height, vsync,
-                 normals='gpu', require_hardware=True, body_rest=None, body_weights=None):
+                 normals='gpu', require_hardware=True, body_rest=None, body_weights=None,
+                 ui=True, playback_speed=1.0):
         import glfw
         import moderngl
         self.glfw, self.gl = glfw, moderngl
         self.window = None
         self.ctx = None
         self.resources = []
+        self.ui = None
+        self.fps = None
+        self.playback_speed = playback_speed
+        self.vsync = vsync
         self.normal_buffers = []
         self.position_buffers = []
         self.skin_buffers = None
@@ -253,26 +238,13 @@ class Renderer:
             self.grid = self.ctx.vertex_array(self.program,
                 [(grid_buffer, '3f 3f', 'position', 'normal')])
             self.resources.extend([grid_buffer, self.grid])
-            self.hud_program = self.ctx.program(vertex_shader='''
-                #version 330
-                in vec2 position;
-                uniform vec2 viewport_size;
-                void main() { gl_Position=vec4(position.x/viewport_size.x*2-1,
-                    1-position.y/viewport_size.y*2, 0, 1); }
-                ''', fragment_shader='''
-                #version 330
-                uniform vec3 color;
-                out vec4 frag_color;
-                void main() { frag_color=vec4(color, 1); }
-                ''')
-            self.hud_buffer = self.ctx.buffer(reserve=65536)
-            self.hud_vao = self.ctx.vertex_array(self.hud_program,
-                                                [(self.hud_buffer, '2f', 'position')])
-            self.resources.extend([self.hud_program, self.hud_buffer, self.hud_vao])
-            self.set_fps(None)
             self.yaw, self.pitch = 0.0, 0.15
             self.paused = self.single_step = self.restart = self.wireframe = False
             self.cursor = None
+            if ui:
+                from viewer_ui import ViewerUI
+                self.ui = ViewerUI(self)
+                glfw.set_char_callback(self.window, self.ui.backend.char_callback)
             glfw.set_key_callback(self.window, self._key)
             glfw.set_cursor_pos_callback(self.window, self._cursor)
             glfw.set_scroll_callback(self.window, self._scroll)
@@ -286,10 +258,14 @@ class Renderer:
 
     def _key(self, window, key, scancode, action, modifiers):
         g = self.glfw
+        if self.ui and 0 <= key < 512:
+            self.ui.backend.keyboard_callback(window, key, scancode, action, modifiers)
         if action != g.PRESS:
             return
         if key == g.KEY_ESCAPE:
             g.set_window_should_close(window, True)
+        elif self.ui and self.ui.captures_keyboard:
+            return
         elif key == g.KEY_SPACE:
             self.paused = not self.paused
         elif key == g.KEY_RIGHT:
@@ -300,12 +276,17 @@ class Renderer:
             self.wireframe = not self.wireframe
 
     def _cursor(self, window, x, y):
-        if self.cursor and self.glfw.get_mouse_button(window, self.glfw.MOUSE_BUTTON_LEFT):
+        if (self.cursor and not (self.ui and self.ui.captures_mouse)
+                and self.glfw.get_mouse_button(window, self.glfw.MOUSE_BUTTON_LEFT)):
             self.yaw -= (x - self.cursor[0]) * 0.006
             self.pitch = float(np.clip(self.pitch + (y - self.cursor[1]) * 0.006, -1.4, 1.4))
         self.cursor = (x, y)
 
     def _scroll(self, window, dx, dy):
+        if self.ui:
+            self.ui.backend.scroll_callback(window, dx, dy)
+            if self.ui.captures_mouse:
+                return
         self.radius = float(np.clip(self.radius * math.exp(-dy * 0.1), 0.02, 1e4))
 
     def upload(self, body, cloth, body_normals=None, cloth_normals=None, matrices=None):
@@ -357,19 +338,11 @@ class Renderer:
         return query
 
     def set_fps(self, fps):
-        text = 'FPS: --' if fps is None else f'FPS: {fps:.1f}'
-        vertices = []
-        def rectangle(x, y, w, h):
-            vertices.extend([(x,y), (x+w,y), (x,y+h), (x,y+h), (x+w,y), (x+w,y+h)])
-        rectangle(8, 8, len(text) * 18 + 12, 33)
-        for index, char in enumerate(text):
-            for row, values in enumerate(GLYPHS.get(char, [])):
-                for column, value in enumerate(values):
-                    if value == '1':
-                        rectangle(14 + index * 18 + column * 3, 14 + row * 3, 3, 3)
-        self.hud_count = len(vertices)
-        self.hud_buffer.orphan()
-        self.hud_buffer.write(np.asarray(vertices, dtype='f4').tobytes())
+        self.fps = fps
+
+    def begin_ui(self):
+        if self.ui:
+            self.ui.prepare()
 
     def draw(self, measure=False):
         width, height = self.glfw.get_framebuffer_size(self.window)
@@ -391,13 +364,8 @@ class Renderer:
                 self.program['color'].value = color
                 vao.render()
             self.ctx.wireframe = False
-            self.ctx.disable(self.gl.DEPTH_TEST)
-            self.hud_program['viewport_size'].value = (width, height)
-            self.hud_program['color'].value = (0.04, 0.05, 0.07)
-            self.hud_vao.render(vertices=6)
-            self.hud_program['color'].value = (0.9, 0.95, 1.0)
-            self.hud_vao.render(first=6, vertices=self.hud_count - 6)
-            self.ctx.enable(self.gl.DEPTH_TEST)
+            if self.ui:
+                self.ui.render()
         finally:
             if query:
                 query.__exit__(None, None, None)
@@ -415,6 +383,9 @@ class Renderer:
         self.glfw.set_window_title(self.window, text)
 
     def close(self):
+        if self.ui:
+            self.ui.close()
+            self.ui = None
         for resource in reversed(self.resources):
             resource.release()
         self.resources.clear()

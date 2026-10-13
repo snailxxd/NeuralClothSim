@@ -1,12 +1,17 @@
 # 单帧推理性能测试
 
+性能报告统一保存到 `benchmarks/<日期>/`，与 `results/` 中的动画 PC2 输出分开。
+已有报告归档于 `benchmarks/2026-10-13/`：`inference/` 为推理基准，
+`viewer/` 为渲染报告和截图，`diagnostics/` 为诊断结果；目录内 README 标注最终结果。
+以下示例使用 `benchmarks/latest/`；需保留历史结果时改为对应日期。
+
 在项目根目录使用同一 checkpoint 比较原始三帧前处理、缓存历史和 XLA 融合路径：
 
 ```bash
 .venv/bin/python scripts/benchmark_inference.py \
   --config ncs/configs/mixamo_resume_2778.json \
   --gpu-id 0 --mode compare --warmup 50 --iterations 500 \
-  --json results/gpu_optimized_benchmark.json
+  --json benchmarks/latest/inference/gpu_optimized_benchmark.json
 ```
 
 模式说明：
@@ -47,7 +52,9 @@ with tf.device('/GPU:0'):
 ```
 
 缓存保存上一帧静态特征、两帧关节位置和 GRU 状态，不修改模型权重。
-调用频率须与配置的 `data.fps` 一致；切换独立动画或瞬移时调用 `reset()`。
+固定时间步接口的调用频率须与配置的 `data.fps` 一致；切换独立动画或瞬移时调用 `reset()`。
+`preview_for_render()` / `preview_with_body()` 接收间隔为配置时间步的三帧输入，
+只读当前 GRU 状态进行预览，不写回历史缓存或 hidden；固定网格帧仍使用 `step()` 提交。
 同一实例不能并发处理不同角色。XLA 路径必须先 reset；不要依赖编译器保留运行时断言。
 
 ## ModernGL + GLFW 实时渲染
@@ -63,40 +70,64 @@ with tf.device('/GPU:0'):
 查看器直接对每帧姿态进行推理，显示同帧的人体和衣服，无需生成 PC2。
 默认读取配置测试列表中的第一条动作，使用 `checkpoints/<config name>` 权重。
 `--checkpoint`、`--sequence-index` 和 `--motion` 可以覆盖这些设置。
-模型始终按配置 `data.fps` 的时间步推进，首帧和循环边界重置历史及 GRU。
-默认使用 GPU 硬件渲染、GPU 法线、OpenGL 人体蒙皮和 XLA，不限速、不限总帧数，
-关闭垂直同步，循环推理并绘制每帧，直到 Esc/关闭窗口。
+默认使用 GPU 硬件渲染、GPU 法线、OpenGL 人体蒙皮和 XLA，运行 `interpolated` 模式。
+按真实动画时间在源关键帧间插值输入姿态：四元数使用最短弧 SLERP，根平移线性插值；
+每个未暂停的绘制帧都执行一次推理，不限制 FPS 或总帧数，动画保持正常播放速度。
+这不是对衣服输出顶点插值，也不是重复播放预计算网格。
+每次预览在动画时刻 `t-2Δt、t-Δt、t` 采样输入，`Δt` 始终为训练配置时间步。
+只有完整模型帧推进持久 GRU 状态；逐绘制帧的预览 hidden 被丢弃，
+避免渲染 FPS 改变模型记忆衰减速度，或微小/抖动间隔放大加速度噪声。
+循环边界恢复原始首帧缓存，并按固定网格推进到当前时刻，不跨动画接缝求差分。
+启动时校验预览关键帧与固定步长输出一致、重复预览可复现且不修改持久状态。
+预览的三帧前处理不使用整段 XLA，以保持 FK 与差分的严格 FP32 数值行为；
+`--xla` 仍用于网络及固定步长提交路径。
+此修复针对时间步和状态更新导致的不稳定，不包含额外碰撞修正，仍可能有模型原有穿模。
+默认关闭垂直同步，`--vsync` 可单独限制绘制刷新率。
+`--mode benchmark` 使用设备常驻、固定时间步输入并不限速推进，每次推理都绘制，
+动画会随吞吐量加速；适合比较推理/渲染最高性能。
+需要固定速率播放时显式使用 `--mode realtime`：动画按配置 `data.fps` 推进，
+两个模型时间步之间重复绘制当前结果；绘制慢时补算到期推理步，仅显示最新结果。
+该模式暂停时冻结动画时间，恢复时不追赶暂停期间的时间，重播重新开始计时。
+`--vsync` 可单独限制绘制刷新率。
 benchmark 模式默认开启单帧预取：一个工作线程顺序执行下一帧推理，
 主线程执行当前帧的 OpenGL 上传、绘制和交换。最多预取一帧，不跳过中间结果。
 下一帧在当前帧绘制命令提交后启动，与交换等待重叠，减少 Python GIL 争用。
 动画循环重置直接恢复首帧的设备缓存，不重复计算初始骨骼特征。
-动画会加速播放，但模型差分时间步保持不变。
-按实际节奏播放使用 `--mode realtime`：处理落后时降低播放速度，不跳过姿态。
+不限速原始帧性能测试需显式使用 `--mode benchmark`。
 
 鼠标左键拖动旋转相机、滚轮缩放；空格暂停/继续，右方向键暂停并前进一帧，
-R 重播，W 切换线框，Esc 退出。视口左上角显示滚动窗口 FPS（包含暂停时重绘），
+R 重播，W 切换线框，Esc 退出。默认启用 Dear ImGui 面板，支持暂停/继续、单步、
+重播、0.1–4 倍播放速度、线框和垂直同步开关；操作面板时不会拖动或缩放相机。
+`--speed 2` 可设置初始倍速。倍速只改变动画时钟，插值推理的差分时间步和持久 GRU
+提交网格保持训练配置值；`benchmark` 模式忽略倍速控制。
+面板显示滚动窗口 FPS（包含暂停时重绘）、帧间隔曲线、推理更新率、动画时间，
+以及最近 240 次更新的各阶段平均/P95 耗时，包括推理、输入插值、上传、GPU 蒙皮/法线、
+绘制和缓冲交换。GPU 查询延后读取，未返回时显示 `--`。
+CPU 提交与 GPU 执行存在重叠，各阶段不可直接相加；Frame processing 不包含 Events + UI build。
 窗口标题单独显示动画更新率和整帧处理时间。FPS 表示缓冲交换速率，不是显示器呈现速率。
-`realtime` 模式请求垂直同步，`benchmark` 模式不等待模型帧率。
+面板构建和绘制也有开销，GPU draw + UI 包含面板绘制。比较纯推理/场景渲染性能时
+可用 `--no-ui` 关闭面板，并在不同运行间保持此选项一致。
+各模式默认均关闭垂直同步；`benchmark` 和 `interpolated` 模式均不等待模型帧率。
 
 ### 完整链路性能测试
 
 ```bash
 .venv/bin/python scripts/view_realtime.py \
   --mode benchmark --no-xla --warmup 50 --iterations 1000 \
-  --json results/viewer_benchmark.json --csv results/viewer_benchmark.csv
+  --json benchmarks/latest/viewer/viewer_benchmark.json --csv benchmarks/latest/viewer/viewer_benchmark.csv
 
 # 使用融合的逐帧路径，仍包含人体蒙皮和绘制
 .venv/bin/python scripts/view_realtime.py \
   --mode benchmark --xla --warmup 50 --iterations 1000 \
-  --json results/viewer_xla_benchmark.json
+  --json benchmarks/latest/viewer/viewer_xla_benchmark.json
 
 # 同一渲染路径关闭推理预取，作串行对照（保留缓冲/重置优化）
-.venv/bin/python scripts/view_realtime.py --no-pipeline --iterations 1000 \
-  --json results/viewer_serial_benchmark.json
+.venv/bin/python scripts/view_realtime.py --mode benchmark --no-pipeline --iterations 1000 \
+  --json benchmarks/latest/viewer/viewer_serial_benchmark.json
 
 # 定时实时播放，结束时保存报告；启动、编译和预热不计入 300 秒
 .venv/bin/python scripts/view_realtime.py --mode realtime --duration 300 \
-  --json results/viewer_realtime.json
+  --json benchmarks/latest/viewer/viewer_realtime.json
 
 # 无窗口数值校验；可加 --device cpu 显式使用 CPU
 .venv/bin/python scripts/view_realtime.py --validate-only
@@ -108,7 +139,8 @@ R 重播，W 切换线框，Esc 退出。视口左上角显示滚动窗口 FPS�
 容差为 `rtol=1e-4, atol=1e-5`，默认关闭 TF32。校验失败不进入渲染。
 `--xla` 编译失败直接报错，不自动改变测试路径。
 XLA 默认开启，`--no-xla` 可以关闭。`--iterations 0` 表示不限总帧数（默认）；
-`--duration 60` 可以做一分钟不限速测试，`--iterations 1000` 用于固定样本数比较。
+`--mode benchmark --duration 60` 可以做一分钟不限速测试，
+`--mode benchmark --iterations 1000` 用于固定样本数比较。
 无限运行只保留最近 10000 个逐帧样本，避免内存无限增长；JSON 的
 `measured_frames` 记录总帧数，`retained_samples` 为保留窗口，耗时分位数基于保留窗口。
 
@@ -120,6 +152,7 @@ XLA 默认开启，`--no-xla` 可以关闭。`--iterations 0` 表示不限总帧
 | 字段 | 含义 |
 | --- | --- |
 | `input_upload_ms` | 选择设备常驻输入的 CPU 开销；输入上传在测量前完成 |
+| `sample_upload_ms` | interpolated 模式的输入 SLERP、平移插值及张量创建 CPU 耗时，已包含于 inference_wait |
 | `inference_readback_ms` | 前处理、网络、衣服蒙皮，以及衣服顶点/骨骼矩阵 CPU 读回；TensorFlow 人体路径还包含人体蒙皮及读回 |
 | `inference_wait_ms` | 渲染线程取得当前帧的等待耗时；流水线中通常远小于实际推理耗时 |
 | `clip_reset_ms` | 此帧推理前恢复初始缓存的耗时，包含于等待区间或与当前帧绘制重叠 |
@@ -149,6 +182,12 @@ GPU 查询延后至少四帧读取，结束时收集尾部结果。CPU 与 GPU �
 JSON 包含逐帧样本、各耗时的 mean/P50/P95/P99、处理吞吐量、
 超过模型帧预算的比例、显卡及 OpenGL renderer 信息。
 `observed_updates_per_second` 包含循环重置、事件处理和播放等待，表示会话实际动画更新率。
+实时播放额外报告 `simulation_steps` / `simulation_updates_per_second`（含补算的模型步）
+及 `rendered_frames` / `render_fps`（含重复绘制的视口刷新），每行 `steps_advanced`
+说明本次显示前实际推进的模型步数。算力不足以完成配置更新率时仍可能落后真实时间。
+输入插值模式中 `animation_time_s` 为去除暂停时间后的动画时钟，
+`simulation_steps` 表示逐绘制帧预览推理次数，更新率可以高于源动作帧率；
+`committed_model_steps` 单独记录固定时间步的状态推进次数。
 运行期间每 30 秒记录进程 RSS 和 TensorFlow GPU 分配器的 current/peak；
 GPU 分配器数值不包含 OpenGL/驱动显存，进程 RSS 包含保留的逐帧报告样本。
 实时模式的吞吐量含同步等待，不能用于推断不限速处理能力。

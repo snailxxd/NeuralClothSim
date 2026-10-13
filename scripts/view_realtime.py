@@ -18,6 +18,34 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def playback_steps(now, deadline, time_step):
+    """Fixed model ticks due at this wall-clock time, independent of draw FPS."""
+    return max(0, int(math.floor((now - deadline) / time_step + 1e-9)) + 1)
+
+
+def sample_interpolated_motion(sequence, seconds):
+    """Shortest-arc quaternion SLERP and linear root translation at wall time."""
+    import numpy as np
+    frame = float(np.clip(seconds, 0, sequence.duration)) * float(sequence.fps)
+    index = min(int(frame), sequence.num_frames - 1)
+    following = min(index + 1, sequence.num_frames - 1)
+    alpha = frame - index
+    q0 = np.asarray(sequence.poses[index], dtype=np.float64)
+    q1 = np.asarray(sequence.poses[following], dtype=np.float64)
+    q0 = q0 / np.maximum(np.linalg.norm(q0, axis=-1, keepdims=True), 1e-12)
+    q1 = q1 / np.maximum(np.linalg.norm(q1, axis=-1, keepdims=True), 1e-12)
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    q1 = np.where(dot < 0, -q1, q1)
+    dot = np.clip(np.abs(dot), 0, 1)
+    angle = np.arccos(dot)
+    denominator = np.maximum(np.sin(angle), 1e-12)
+    spherical = (np.sin((1 - alpha) * angle) * q0 + np.sin(alpha * angle) * q1) / denominator
+    pose = np.where(dot > 0.9995, (1 - alpha) * q0 + alpha * q1, spherical)
+    pose /= np.maximum(np.linalg.norm(pose, axis=-1, keepdims=True), 1e-12)
+    trans = (1 - alpha) * sequence.trans[index] + alpha * sequence.trans[following]
+    return pose.astype(np.float32)[None], np.asarray(trans, dtype=np.float32)[None]
+
+
 class FramePrefetch:
     """One serial inference worker, at most one frame ahead of the renderer.
 
@@ -65,7 +93,11 @@ def parse_args():
     parser.add_argument('--device', choices=['gpu', 'cpu'], default='gpu')
     parser.add_argument('--sequence-index', type=int, default=0)
     parser.add_argument('--motion', type=float, default=1.0)
-    parser.add_argument('--mode', choices=['realtime', 'benchmark'], default='benchmark')
+    parser.add_argument('--mode', choices=['interpolated', 'realtime', 'benchmark'], default='interpolated')
+    parser.add_argument('--vsync', action=argparse.BooleanOptionalAction, default=False,
+                        help='Limit drawing to display refresh; independent of animation time')
+    parser.add_argument('--ui', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--speed', type=float, default=1.0, help='Animation playback multiplier (0.1 to 4)')
     parser.add_argument('--xla', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--pipeline', action=argparse.BooleanOptionalAction, default=True,
                         help='Overlap next-frame inference with rendering in benchmark mode')
@@ -95,6 +127,8 @@ def parse_args():
         parser.error('--gpu-id must identify one GPU')
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
         parser.error('--duration must be finite and positive')
+    if not math.isfinite(args.speed) or not 0.1 <= args.speed <= 4:
+        parser.error('--speed must be between 0.1 and 4')
     return args
 
 
@@ -292,6 +326,34 @@ def main():
         if args.validate_only:
             save_report(args, report, samples, np)
             return
+        preview_base = stream.preview_for_render if gpu_body else stream.preview_with_body
+        # Full XLA compilation of three-frame FK changes its numerical behavior
+        # on this TF/GPU stack. Keep FK/differences in strict FP32; fuse only NN.
+        if args.xla:
+            stream.preview_network_step = tf.function(stream.network_step.python_function, jit_compile=True)
+        preview_step = preview_base
+        if args.mode == 'interpolated':
+            start = time.perf_counter()
+            reset()
+            preview_error = 0.0
+            for i in range(min(count, 32)):
+                p = tf.constant(poses[None, i:i + 3])
+                t = tf.constant(trans[None, i:i + 3])
+                before = [v.numpy().copy() for v in state_variables]
+                actual = preview_step(p, t)
+                repeated = preview_step(p, t)
+                for a, b in zip(actual, repeated):
+                    np.testing.assert_array_equal(a.numpy(), b.numpy())
+                for variable, expected in zip(state_variables, before):
+                    np.testing.assert_array_equal(variable.numpy(), expected)
+                expected = step(p[:, -1:], t[:, -1:])
+                for a, b in zip(actual, expected):
+                    np.testing.assert_allclose(a.numpy(), b.numpy(), rtol=1e-4, atol=1e-5)
+                    preview_error = max(preview_error, float(np.max(np.abs(a.numpy() - b.numpy()))))
+            reset()
+            report['validation']['preview_keyframe_max_abs_error'] = preview_error
+            report['validation']['preview_preserves_state'] = True
+            report['preview_compile_and_validation_ms'] = (time.perf_counter() - start) * 1000
         from realtime_renderer import Renderer, vertex_normals, is_software_renderer
         if Path(wsl_lib, 'libd3d12.so').exists():
             adapter = args.render_adapter or report['gpu'].get('device_name')
@@ -305,7 +367,11 @@ def main():
         for frame in device_frames:
             for value in frame:
                 value.numpy()
-        report.update(inputs_device_resident=True, normals=args.normals,
+        report.update(inputs_device_resident=args.mode != 'interpolated', normals=args.normals,
+                      input_interpolation='quaternion SLERP / linear translation' if args.mode == 'interpolated' else None,
+                      temporal_feature_dt='config time_step',
+                      recurrent_state_rate_hz=config.data.fps if args.mode == 'interpolated' else None,
+                      preview_spatial_xla=False,
                       pipeline=args.pipeline and args.mode == 'benchmark',
                       clip_reset='restore device-resident initial cache',
                       body_skinning='opengl' if gpu_body else 'tensorflow',
@@ -315,8 +381,9 @@ def main():
             start = time.perf_counter()
             renderer = Renderer(first[0][0, 0], first[1][0, 0], model.body.faces,
                                 model.garment.faces, args.width, args.height,
-                                vsync=args.mode == 'realtime', normals=args.normals,
+                                vsync=args.vsync, normals=args.normals,
                                 require_hardware=args.render_device == 'hardware',
+                                ui=args.ui, playback_speed=args.speed,
                                 body_rest=model.body.vertices if gpu_body else None,
                                 body_weights=model.lbs_body.blend_weights.numpy() if gpu_body else None)
             renderer_init_ms = (time.perf_counter() - start) * 1000
@@ -340,11 +407,13 @@ def main():
             report.update(opengl={key: info.get(key) for key in
                                   ('GL_VENDOR', 'GL_RENDERER', 'GL_VERSION')},
                           software_renderer=software, window_size=[args.width, args.height],
-                          vsync_requested=args.mode == 'realtime',
+                          vsync_requested=args.vsync,
+                          ui_enabled=args.ui, playback_speed_initial=args.speed,
                           renderer_init_ms=renderer_init_ms,
-                          timing_notes='Wall clock; source inputs device resident; '
+                          timing_notes='Wall clock; input sampling/upload included in inference_wait '
+                          'for interpolated mode; otherwise source inputs device resident. '
                           'inference reads cloth+bone matrices (OpenGL body) or body+cloth (TF body). '
-                          'GPU mesh query covers skinning/normals; draw query covers clear/draw/HUD, '
+                          'GPU mesh query covers skinning/normals; draw query covers clear/draw/UI, '
                           'not upload or presentation; worker/render stages overlap when pipeline=true. '
                           'Processing includes waiting for inference/reset, excludes pacing '
                           'and delayed query collection. Swap is not screen presentation.')
@@ -416,9 +485,25 @@ def main():
             report['memory_samples'] = [memory_sample(tf, device, 0)]
             report['completed'] = False
             report['total_frames'] = 0
+            report['simulation_steps'] = 0
+            rendered_frames = 0
+            was_paused = renderer.paused
+            last_speed = renderer.playback_speed
+            animation_time = 0.0
+            last_clock = started
+            animation_loop = 0
+            committed_index = -1
+            report['committed_model_steps'] = 0
+            loop_duration = count * config.time_step
             while not renderer.glfw.window_should_close(renderer.window):
                 event_started = time.perf_counter()
                 renderer.glfw.poll_events()
+                if renderer.ui:
+                    renderer.ui.state.update(mode=args.mode,
+                                             animation_time=(animation_time if args.mode == 'interpolated'
+                                                             else index * config.time_step),
+                                             model_fps=config.data.fps)
+                renderer.begin_ui()
                 event_done = time.perf_counter()
                 if args.duration is not None and time.perf_counter() - started >= args.duration:
                     report['completed'] = True
@@ -431,27 +516,80 @@ def main():
                         reset()
                     index = 0
                     next_due = time.perf_counter()
+                    animation_time = 0.0
+                    animation_loop = 0
+                    committed_index = -1
+                    last_clock = next_due
                     renderer.restart = False
                     renderer.single_step = renderer.paused
                 if args.mode == 'benchmark' and args.iterations and report['total_frames'] >= args.iterations:
                     report['completed'] = True
                     break
                 now = time.perf_counter()
+                if args.mode == 'interpolated':
+                    if not was_paused and not renderer.paused:
+                        animation_time += (now - last_clock) * renderer.playback_speed
+                    if renderer.single_step:
+                        animation_time += config.time_step
+                    last_clock = now
+                if was_paused and not renderer.paused:
+                    next_due = now
+                if args.mode == 'realtime' and renderer.playback_speed != last_speed:
+                    next_due = now
+                last_speed = renderer.playback_speed
+                was_paused = renderer.paused
                 ready = renderer.single_step or (not renderer.paused and
-                    (args.mode == 'benchmark' or now >= next_due))
+                    (args.mode in ('benchmark', 'interpolated') or now >= next_due))
                 if not ready:
+                    renderer.draw()
+                    renderer.swap()
+                    rendered_frames += 1
                     if renderer.paused:
-                        renderer.draw()
-                        renderer.swap()
                         renderer.glfw.wait_events_timeout(0.005)
-                    else:
-                        # No interpolated display frames: wait for the next model
-                        # tick instead of overshooting it with another buffer swap.
-                        renderer.glfw.wait_events_timeout(min(max(next_due - now, 0.0001), 0.01))
                     continue
                 frame_started = time.perf_counter()
                 input_done = time.perf_counter()
-                result = pipeline.take(index) if pipeline else compute_frame(index)
+                sample_upload_ms = 0.0
+                steps = (playback_steps(now, next_due, config.time_step / renderer.playback_speed)
+                         if args.mode == 'realtime' and not renderer.single_step else 1)
+                for tick in range(steps):
+                    if args.mode == 'interpolated':
+                        loop = int(animation_time / loop_duration)
+                        sample_time = animation_time % loop_duration
+                        sample_reset_ms = 0.0
+                        if loop != animation_loop:
+                            reset_started = time.perf_counter()
+                            reset()
+                            sample_reset_ms = (time.perf_counter() - reset_started) * 1000
+                            animation_loop = loop
+                            committed_index = -1
+                        index = min(count - 1, int(sample_time / config.time_step))
+                        # Only complete grid frames advance the persistent GRU.
+                        # Fractional previews use the state before their grid frame.
+                        while committed_index < index - 1:
+                            committed_index += 1
+                            step(*device_frames[committed_index])[-1].numpy()
+                            report['committed_model_steps'] += 1
+                        sample_started = time.perf_counter()
+                        history_times = sample_time + np.arange(-2, 1) * config.time_step
+                        sampled = [sample_interpolated_motion(sequence, seconds) for seconds in history_times]
+                        sampled_pose = np.concatenate([value[0] for value in sampled], axis=0)
+                        sampled_trans = np.concatenate([value[1] for value in sampled], axis=0)
+                        p, t = tf.constant(sampled_pose[None]), tf.constant(sampled_trans[None])
+                        sample_upload_ms = (time.perf_counter() - sample_started) * 1000
+                        infer_start = time.perf_counter()
+                        output = preview_step(p, t)
+                        if gpu_body:
+                            cloth, matrices = output[0].numpy()[0, 0], output[1].numpy()
+                            body = None
+                        else:
+                            body, cloth = output[0].numpy()[0, 0], output[1].numpy()[0, 0]
+                            matrices = None
+                        result = body, cloth, matrices, infer_start, time.perf_counter(), sample_reset_ms
+                    else:
+                        result = pipeline.take(index) if pipeline else compute_frame(index)
+                    if tick + 1 < steps:
+                        index = (index + 1) % count
                 body, cloth, matrices, infer_started, infer_finished, reset_ms = result
                 inference_done = time.perf_counter()
                 if not (np.isfinite(matrices if gpu_body else body).all() and np.isfinite(cloth).all()):
@@ -471,8 +609,14 @@ def main():
                     pipeline.prefetch((index + 1) % count)
                 prefetch_done = time.perf_counter()
                 renderer.swap()
+                rendered_frames += 1
                 finished = time.perf_counter()
                 row = {'sample': report['total_frames'], 'clip_frame': index,
+                       'steps_advanced': steps,
+                       'animation_time_s': animation_time if args.mode == 'interpolated' else None,
+                       'sample_upload_ms': sample_upload_ms,
+                       'playback_speed': renderer.playback_speed,
+                       'vsync_requested': renderer.vsync,
                        'width': renderer.ctx.viewport[2], 'height': renderer.ctx.viewport[3],
                        'event_poll_ms': (event_done - event_started) * 1000,
                        'query_collect_ms': 0.0,
@@ -493,6 +637,7 @@ def main():
                        'gpu_draw_ms': None, 'gpu_mesh_update_ms': None}
                 samples.append(row)
                 report['total_frames'] += 1
+                report['simulation_steps'] += steps
                 if query is not None:
                     pending.append((row, query, normal_query))
                 collect_started = time.perf_counter()
@@ -502,10 +647,16 @@ def main():
                     if old_normal_query is not None:
                         old['gpu_mesh_update_ms'] = old_normal_query.elapsed / 1e6
                 row['query_collect_ms'] = (time.perf_counter() - collect_started) * 1000
+                if renderer.ui:
+                    renderer.ui.history.append(row)
                 last_frame = finished
-                index = (index + 1) % count
+                if args.mode != 'interpolated':
+                    index = (index + 1) % count
                 renderer.single_step = False
-                next_due = max(frame_started + config.time_step, time.perf_counter())
+                if renderer.paused:
+                    next_due = finished + config.time_step / renderer.playback_speed
+                else:
+                    next_due += steps * config.time_step / renderer.playback_speed
                 if finished - last_title >= 0.5:
                     recent = list(samples)[-30:]
                     intervals = [x['update_interval_ms'] for x in recent if x['update_interval_ms']]
@@ -517,6 +668,11 @@ def main():
                     report['memory_samples'].append(memory_sample(tf, device, finished - started))
                     last_memory = finished
             report['session_wall_seconds'] = time.perf_counter() - started
+            report['playback_speed_final'] = renderer.playback_speed
+            report['vsync_final'] = renderer.vsync
+            report['rendered_frames'] = rendered_frames
+            report['render_fps'] = rendered_frames / report['session_wall_seconds']
+            report['simulation_updates_per_second'] = report['simulation_steps'] / report['session_wall_seconds']
             report['memory_samples'].append(memory_sample(tf, device, report['session_wall_seconds']))
         finally:
             try:

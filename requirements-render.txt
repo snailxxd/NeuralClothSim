@@ -1,3 +1,5 @@
 # Optional interactive viewer; install alongside requirements.txt / requirements-gpu.txt.
 moderngl==5.12.0
 glfw==2.9.0
+imgui==2.0.0
+PyOpenGL==3.1.10
