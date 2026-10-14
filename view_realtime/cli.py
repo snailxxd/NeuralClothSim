@@ -17,11 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 InferenceFrame = namedtuple('InferenceFrame', 'local matrices started finished reset_ms')
 
 
-from playback import PlaybackClock, FixedStepPlayback, DisplaySkeleton, sample_interpolated_motion
+from .playback import PlaybackClock, FixedStepPlayback, DisplaySkeleton, sample_interpolated_motion
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog='python -m view_realtime', description=__doc__)
     parser.add_argument('--config', type=Path, default=ROOT / 'ncs/configs/test.json')
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--gpu-id', default='0')
@@ -161,7 +161,7 @@ def main():
         paths = os.environ.get('LD_LIBRARY_PATH', '').split(':')
         if wsl_lib not in paths:
             os.environ['LD_LIBRARY_PATH'] = ':'.join([wsl_lib] + [p for p in paths if p])
-            os.execv(sys.executable, [sys.executable, *sys.argv])
+            os.execv(sys.executable, [sys.executable, '-m', 'view_realtime', *sys.argv[1:]])
         if args.render_device != 'software':
             os.environ.setdefault('GALLIUM_DRIVER', 'd3d12')
     if args.render_device == 'software':
@@ -260,7 +260,7 @@ def main():
         if args.validate_only:
             save_report(args, report, samples, np)
             return
-        from realtime_renderer import Renderer, is_software_renderer
+        from .realtime_renderer import Renderer, is_software_renderer
         if Path(wsl_lib, 'libd3d12.so').exists():
             adapter = args.render_adapter or report['gpu'].get('device_name')
             if adapter:
@@ -469,8 +469,3 @@ def main():
                     renderer.close()
 
 
-if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass

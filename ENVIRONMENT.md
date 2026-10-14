@@ -67,10 +67,10 @@ python -m pip install -r requirements-gpu.txt
 
 ```bash
 .venv/bin/python -m pip install -r requirements-render.txt
-.venv/bin/python scripts/view_realtime.py --xla
+.venv/bin/python -m view_realtime --xla
 ```
 
-实时播放、键鼠操作及性能测试方法见 [scripts/BENCHMARK.md](scripts/BENCHMARK.md#moderngl--glfw-实时渲染)。
+模块结构和测试命令见 [view_realtime/README.md](view_realtime/README.md)，实时播放、键鼠操作及性能测试方法见 [scripts/BENCHMARK.md](scripts/BENCHMARK.md#moderngl--glfw-实时渲染)。
 需要可用的图形会话；CUDA 可用不代表 OpenGL 使用硬件加速，启动时会输出 renderer。
 
 ## Blender 可视化

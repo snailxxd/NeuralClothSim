@@ -221,7 +221,7 @@ class Renderer:
             self.paused = self.single_step = self.restart = self.wireframe = False
             self.cursor = None
             if ui:
-                from viewer_ui import ViewerUI
+                from .viewer_ui import ViewerUI
                 self.ui = ViewerUI(self)
                 glfw.set_char_callback(self.window, self.ui.backend.char_callback)
             glfw.set_key_callback(self.window, self._key)

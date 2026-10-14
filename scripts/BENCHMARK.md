@@ -64,7 +64,7 @@ with tf.device('/GPU:0'):
 
 ```bash
 .venv/bin/python -m pip install -r requirements-render.txt
-.venv/bin/python scripts/view_realtime.py \
+.venv/bin/python -m view_realtime \
   --config ncs/configs/test.json --gpu-id 0
 ```
 
@@ -114,11 +114,11 @@ CPU/GPU 阶段有重叠，不可直接相加。FPS 表示交换缓冲速率，�
 
 ```bash
 # 原速播放 60 秒，测量模型延迟与完整显示链路
-.venv/bin/python scripts/view_realtime.py --duration 60 \
+.venv/bin/python -m view_realtime --duration 60 \
   --json benchmarks/latest/viewer/realtime.json --csv benchmarks/latest/viewer/realtime.csv
 
 # 原速播放，排除 ImGui 开销
-.venv/bin/python scripts/view_realtime.py --no-ui --duration 60 \
+.venv/bin/python -m view_realtime --no-ui --duration 60 \
   --json benchmarks/latest/viewer/realtime_no_ui.json
 
 # 不限速纯推理性能测试使用独立脚本，不改变查看器播放行为
@@ -126,7 +126,7 @@ CPU/GPU 阶段有重叠，不可直接相加。FPS 表示交换缓冲速率，�
   --json benchmarks/latest/inference/cached_xla.json
 
 # 无窗口验证：局部输出蒙皮后与原模型对齐
-.venv/bin/python scripts/view_realtime.py --validate-only
+.venv/bin/python -m view_realtime --validate-only
 ```
 
 每次启动对最多 32 帧进行人体、衣物、GRU 和重置校验。

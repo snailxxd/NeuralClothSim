@@ -7,10 +7,10 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from realtime_renderer import Renderer, camera_matrix, normal_adjacency, is_software_renderer
-from view_realtime import save_report
-from playback import PlaybackClock, FixedStepPlayback, DisplaySkeleton, sample_interpolated_motion
-from viewer_ui import PerformanceHistory
+from .realtime_renderer import Renderer, camera_matrix, normal_adjacency, is_software_renderer
+from .cli import save_report
+from .playback import PlaybackClock, FixedStepPlayback, DisplaySkeleton, sample_interpolated_motion
+from .viewer_ui import PerformanceHistory
 
 
 def reference_normals(vertices, faces):
