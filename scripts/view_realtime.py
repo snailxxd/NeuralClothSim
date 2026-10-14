@@ -22,7 +22,7 @@ from playback import PlaybackClock, FixedStepPlayback, DisplaySkeleton, sample_i
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=ROOT / 'ncs/configs/mixamo_resume_2778.json')
+    parser.add_argument('--config', type=Path, default=ROOT / 'ncs/configs/test.json')
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--gpu-id', default='0')
     parser.add_argument('--device', choices=['gpu', 'cpu'], default='gpu')

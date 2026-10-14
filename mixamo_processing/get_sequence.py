@@ -36,14 +36,16 @@ def main(file, dst):
             q += [b.rotation_quaternion]
         Q += [np.stack(q, 0)]
     Q = np.stack(Q, 0)
-    L = np.stack(L, 0)
+    # Match get_body_model.py: Mixamo bone locations are in centimeters,
+    # while the exported body vertices and joints are in meters.
+    L = np.stack(L, 0) * 0.01
 
     """ SAVE """
     np.savez(
         dst,
         poses=Q,
         trans=L,
-        fps=float(sc.render.fps),
+        fps=float(sc.render.fps / sc.render.fps_base),
         source=file.split(os.path.sep)[-1],
     )
 
@@ -51,4 +53,8 @@ def main(file, dst):
 
 
 if __name__ == "__main__":
-    main(file="path_to_fbx_file.fbx", dst="path_to_output.npz")
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    main(
+        file=os.path.join(project_dir, "data", "mixamo", "Walking.fbx"),
+        dst=os.path.join(project_dir, "data", "mixamo", "Walking.npz"),
+    )

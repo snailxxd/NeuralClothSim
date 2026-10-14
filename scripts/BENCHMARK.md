@@ -9,7 +9,7 @@
 
 ```bash
 .venv/bin/python scripts/benchmark_inference.py \
-  --config ncs/configs/mixamo_resume_2778.json \
+  --config ncs/configs/test.json \
   --gpu-id 0 --mode compare --warmup 50 --iterations 500 \
   --json benchmarks/latest/inference/gpu_optimized_benchmark.json
 ```
@@ -65,7 +65,7 @@ with tf.device('/GPU:0'):
 ```bash
 .venv/bin/python -m pip install -r requirements-render.txt
 .venv/bin/python scripts/view_realtime.py \
-  --config ncs/configs/mixamo_resume_2778.json --gpu-id 0
+  --config ncs/configs/test.json --gpu-id 0
 ```
 
 默认 `--speed 1`：动画按真实时间原速播放，模型按训练配置
