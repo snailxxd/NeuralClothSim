@@ -1,12 +1,10 @@
-"""Infer and draw every motion frame with ModernGL + GLFW.
+"""Fixed-step model inference with smooth GPU animation rendering.
 
-Run from any directory. Model time always advances by config.time_step;
-benchmark mode removes pacing, not temporal history.
+Playback follows wall time; model ticks and display FPS are independent.
 """
 
 import argparse
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque, namedtuple
 import csv
 import json
 import math
@@ -16,73 +14,10 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+InferenceFrame = namedtuple('InferenceFrame', 'local matrices started finished reset_ms')
 
 
-def playback_steps(now, deadline, time_step):
-    """Fixed model ticks due at this wall-clock time, independent of draw FPS."""
-    return max(0, int(math.floor((now - deadline) / time_step + 1e-9)) + 1)
-
-
-def sample_interpolated_motion(sequence, seconds):
-    """Shortest-arc quaternion SLERP and linear root translation at wall time."""
-    import numpy as np
-    frame = float(np.clip(seconds, 0, sequence.duration)) * float(sequence.fps)
-    index = min(int(frame), sequence.num_frames - 1)
-    following = min(index + 1, sequence.num_frames - 1)
-    alpha = frame - index
-    q0 = np.asarray(sequence.poses[index], dtype=np.float64)
-    q1 = np.asarray(sequence.poses[following], dtype=np.float64)
-    q0 = q0 / np.maximum(np.linalg.norm(q0, axis=-1, keepdims=True), 1e-12)
-    q1 = q1 / np.maximum(np.linalg.norm(q1, axis=-1, keepdims=True), 1e-12)
-    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
-    q1 = np.where(dot < 0, -q1, q1)
-    dot = np.clip(np.abs(dot), 0, 1)
-    angle = np.arccos(dot)
-    denominator = np.maximum(np.sin(angle), 1e-12)
-    spherical = (np.sin((1 - alpha) * angle) * q0 + np.sin(alpha * angle) * q1) / denominator
-    pose = np.where(dot > 0.9995, (1 - alpha) * q0 + alpha * q1, spherical)
-    pose /= np.maximum(np.linalg.norm(pose, axis=-1, keepdims=True), 1e-12)
-    trans = (1 - alpha) * sequence.trans[index] + alpha * sequence.trans[following]
-    return pose.astype(np.float32)[None], np.asarray(trans, dtype=np.float32)[None]
-
-
-class FramePrefetch:
-    """One serial inference worker, at most one frame ahead of the renderer.
-
-    The worker never touches OpenGL. Drain before replay/reset so discarded
-    predictions cannot overwrite the new clip's recurrent state.
-    """
-
-    def __init__(self, compute):
-        self.compute = compute
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ncs-inference')
-        self.future = None
-        self.index = None
-
-    def prefetch(self, index):
-        if self.future is not None:
-            raise RuntimeError('Only one prefetched frame is allowed')
-        self.index = index
-        self.future = self.executor.submit(self.compute, index)
-
-    def take(self, index):
-        if self.future is None:
-            self.prefetch(index)
-        if self.index != index:
-            raise RuntimeError('Prefetched frame is out of order')
-        future, self.future = self.future, None
-        return future.result()
-
-    def discard(self):
-        if self.future is not None:
-            future, self.future = self.future, None
-            future.result()
-
-    def close(self):
-        try:
-            self.discard()
-        finally:
-            self.executor.shutdown(wait=True)
+from playback import PlaybackClock, FixedStepPlayback, DisplaySkeleton, sample_interpolated_motion
 
 
 def parse_args():
@@ -93,22 +28,14 @@ def parse_args():
     parser.add_argument('--device', choices=['gpu', 'cpu'], default='gpu')
     parser.add_argument('--sequence-index', type=int, default=0)
     parser.add_argument('--motion', type=float, default=1.0)
-    parser.add_argument('--mode', choices=['interpolated', 'realtime', 'benchmark'], default='interpolated')
     parser.add_argument('--vsync', action=argparse.BooleanOptionalAction, default=False,
                         help='Limit drawing to display refresh; independent of animation time')
     parser.add_argument('--ui', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--speed', type=float, default=1.0, help='Animation playback multiplier (0.1 to 4)')
     parser.add_argument('--xla', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--pipeline', action=argparse.BooleanOptionalAction, default=True,
-                        help='Overlap next-frame inference with rendering in benchmark mode')
     parser.add_argument('--render-device', choices=['hardware', 'auto', 'software'], default='hardware')
     parser.add_argument('--render-adapter', help='WSL D3D12 adapter name substring; defaults to inference GPU')
-    parser.add_argument('--normals', choices=['gpu', 'cpu'], default='gpu')
-    parser.add_argument('--body-skinning', choices=['auto', 'tensorflow'], default='auto',
-                        help='auto: skin body in OpenGL when GPU normals are selected')
     parser.add_argument('--warmup', type=int, default=50)
-    parser.add_argument('--iterations', type=int, default=0,
-                        help='Measured frames in benchmark mode; 0 means unlimited (default)')
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
     parser.add_argument('--duration', type=float,
@@ -121,8 +48,8 @@ def parse_args():
     for key in ('width', 'height'):
         if getattr(args, key) <= 0:
             parser.error(f'--{key} must be positive')
-    if args.warmup < 0 or args.sequence_index < 0 or args.iterations < 0:
-        parser.error('--warmup, --iterations and --sequence-index must be nonnegative')
+    if args.warmup < 0 or args.sequence_index < 0:
+        parser.error('--warmup and --sequence-index must be nonnegative')
     if not args.gpu_id.isdigit():
         parser.error('--gpu-id must identify one GPU')
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
@@ -179,9 +106,12 @@ def save_report(args, report, samples, np):
     summary = {}
     if samples:
         for key in samples[0]:
-            if not key.endswith('_ms'):
+            if not key.endswith('_ms') or key == 'inference_samples_ms':
                 continue
-            values = np.asarray([row[key] for row in samples if row[key] is not None])
+            values = np.asarray([value for row in samples
+                                 for value in (row.get('inference_samples_ms', [row[key]])
+                                               if key == 'inference_readback_ms' else [row[key]])
+                                 if value is not None])
             if len(values):
                 summary[key] = {'mean': float(values.mean()),
                                 'p50': float(np.percentile(values, 50)),
@@ -191,7 +121,10 @@ def save_report(args, report, samples, np):
         summary['processing_fps'] = float(1000 / total.mean())
         summary['over_budget_fraction'] = float(np.mean(total > 1000 / report['model_fps']))
         if report.get('session_wall_seconds', 0) > 0:
-            summary['observed_updates_per_second'] = report.get('total_frames', len(samples)) / report['session_wall_seconds']
+            summary['observed_draws_per_second'] = report.get('total_frames', len(samples)) / report['session_wall_seconds']
+            summary['observed_model_steps_per_second'] = report.get('simulation_steps', 0) / report['session_wall_seconds']
+        if 'inference_readback_ms' in summary:
+            summary['serial_model_steps_per_second_estimate'] = 1000 / summary['inference_readback_ms']['mean']
     report.update(summary=summary, measured_frames=report.get('total_frames', len(samples)),
                   retained_samples=len(samples), samples=samples)
     if args.json:
@@ -262,11 +195,13 @@ def main():
         raise ValueError(f'Sequence index out of range: {len(names)} test sequences')
     source = Path(DATA_DIR) / config.data.dataset / names[args.sequence_index]
     sequence = PoseSequence(str(source))
+    if sequence.poses.shape[-1] != 4:
+        raise ValueError('Viewer requires quaternion motion poses for SLERP playback')
     count = int(np.floor(sequence.duration / config.time_step + 1e-6)) + 1
     poses, trans = sequence.get(np.arange(-2, count) * config.time_step, extrapolation='clip')
     device = '/GPU:0' if args.device == 'gpu' else '/CPU:0'
-    samples, pending = deque(maxlen=args.iterations or 10000), deque()
-    renderer = pipeline = None
+    samples, pending = deque(maxlen=10000), deque()
+    renderer = None
     with tf.device(device):
         start = time.perf_counter()
         model = NCS(config)
@@ -275,15 +210,14 @@ def main():
         status.assert_existing_objects_matched()
         status.expect_partial()
         stream = StreamingNCS(model, motion=args.motion)
-        gpu_body = args.normals == 'gpu' and args.body_skinning == 'auto' and not args.validate_only
-        base_step = stream.step_for_render if gpu_body else stream.step_with_body
+        base_step = stream.step_local
         step = tf.function(base_step.python_function, jit_compile=True) if args.xla else base_step
 
         def validation_step(p, t):
-            if gpu_body:
-                cloth, matrices, hidden = step(p, t)
-                return model.lbs_body(model.body.vertices, matrices), cloth, hidden
-            return step(p, t)
+            local, matrices, hidden = step(p, t)
+            body = model.lbs_body(model.body.vertices, matrices)
+            cloth = model.lbs_cloth(local, tf.gather(matrices, model.body.input_joints, axis=-3))
+            return body, cloth, hidden
         history = (tf.constant(poses[None, :1]), tf.constant(trans[None, :1]),
                    tf.constant(poses[None, 1:2]), tf.constant(trans[None, 1:2]))
 
@@ -318,7 +252,7 @@ def main():
                   'sequence': str(source), 'source_frames': count, 'model_fps': config.data.fps,
                   'tensorflow': tf.__version__, 'device': device, 'xla': args.xla,
                   'gpu': tf.config.experimental.get_device_details(gpus[0]) if gpus else {},
-                  'mode': args.mode, 'tf32': False, 'body_vertices': model.body.num_verts,
+                  'mode': 'realtime', 'tf32': False, 'body_vertices': model.body.num_verts,
                   'cloth_vertices': model.garment.num_verts, 'motion': args.motion,
                   'warmup_frames': args.warmup, 'model_load_ms': load_ms,
                   'first_step_including_compile_ms': first_ms, 'validation': validation}
@@ -326,35 +260,7 @@ def main():
         if args.validate_only:
             save_report(args, report, samples, np)
             return
-        preview_base = stream.preview_for_render if gpu_body else stream.preview_with_body
-        # Full XLA compilation of three-frame FK changes its numerical behavior
-        # on this TF/GPU stack. Keep FK/differences in strict FP32; fuse only NN.
-        if args.xla:
-            stream.preview_network_step = tf.function(stream.network_step.python_function, jit_compile=True)
-        preview_step = preview_base
-        if args.mode == 'interpolated':
-            start = time.perf_counter()
-            reset()
-            preview_error = 0.0
-            for i in range(min(count, 32)):
-                p = tf.constant(poses[None, i:i + 3])
-                t = tf.constant(trans[None, i:i + 3])
-                before = [v.numpy().copy() for v in state_variables]
-                actual = preview_step(p, t)
-                repeated = preview_step(p, t)
-                for a, b in zip(actual, repeated):
-                    np.testing.assert_array_equal(a.numpy(), b.numpy())
-                for variable, expected in zip(state_variables, before):
-                    np.testing.assert_array_equal(variable.numpy(), expected)
-                expected = step(p[:, -1:], t[:, -1:])
-                for a, b in zip(actual, expected):
-                    np.testing.assert_allclose(a.numpy(), b.numpy(), rtol=1e-4, atol=1e-5)
-                    preview_error = max(preview_error, float(np.max(np.abs(a.numpy() - b.numpy()))))
-            reset()
-            report['validation']['preview_keyframe_max_abs_error'] = preview_error
-            report['validation']['preview_preserves_state'] = True
-            report['preview_compile_and_validation_ms'] = (time.perf_counter() - start) * 1000
-        from realtime_renderer import Renderer, vertex_normals, is_software_renderer
+        from realtime_renderer import Renderer, is_software_renderer
         if Path(wsl_lib, 'libd3d12.so').exists():
             adapter = args.render_adapter or report['gpu'].get('device_name')
             if adapter:
@@ -367,80 +273,66 @@ def main():
         for frame in device_frames:
             for value in frame:
                 value.numpy()
-        report.update(inputs_device_resident=args.mode != 'interpolated', normals=args.normals,
-                      input_interpolation='quaternion SLERP / linear translation' if args.mode == 'interpolated' else None,
-                      temporal_feature_dt='config time_step',
-                      recurrent_state_rate_hz=config.data.fps if args.mode == 'interpolated' else None,
-                      preview_spatial_xla=False,
-                      pipeline=args.pipeline and args.mode == 'benchmark',
-                      clip_reset='restore device-resident initial cache',
-                      body_skinning='opengl' if gpu_body else 'tensorflow',
+
+        skeleton = DisplaySkeleton(model.body)
+        # Reuse trained (including trainable softmax) cloth weights in OpenGL.
+        weights = model.lbs_cloth.blend_weights
+        weights = tf.nn.softmax(weights) if model.lbs_cloth.trainable else weights
+        cloth_weights = np.zeros((model.garment.num_verts, model.body.num_joints), dtype='f4')
+        cloth_weights[:, model.body.input_joints] = weights.numpy()
+        report.update(inputs_device_resident=True, normals='gpu',
+                      display_interpolation='local cloth linear / pose SLERP then FK',
+                      display_delay_animation_ms=config.time_step * 1000,
+                      body_skinning='opengl', cloth_skinning='opengl',
                       render_device_requested=args.render_device,
                       retained_sample_limit=samples.maxlen)
         try:
             start = time.perf_counter()
             renderer = Renderer(first[0][0, 0], first[1][0, 0], model.body.faces,
-                                model.garment.faces, args.width, args.height,
-                                vsync=args.vsync, normals=args.normals,
+                                model.garment.faces, args.width, args.height, vsync=args.vsync,
                                 require_hardware=args.render_device == 'hardware',
                                 ui=args.ui, playback_speed=args.speed,
-                                body_rest=model.body.vertices if gpu_body else None,
-                                body_weights=model.lbs_body.blend_weights.numpy() if gpu_body else None)
+                                body_rest=model.body.vertices,
+                                body_weights=model.lbs_body.blend_weights.numpy(),
+                                cloth_weights=cloth_weights)
             renderer_init_ms = (time.perf_counter() - start) * 1000
-            # Validate actual OpenGL body skinning for every reference frame;
-            # this readback is startup-only, never part of the timed frame loop.
-            if gpu_body:
-                reset()
-                max_body_error = 0.0
-                for p, t in device_frames[:32]:
-                    cloth, matrices, _ = step(p, t)
-                    expected_body = model.lbs_body(model.body.vertices, matrices).numpy()[0, 0]
-                    renderer.upload(None, cloth.numpy()[0, 0], matrices=matrices.numpy())
-                    renderer.update_normals()
-                    actual = np.frombuffer(renderer.meshes[0][0].read(), dtype='f4').reshape(-1, 6)[:, :3]
-                    np.testing.assert_allclose(actual, expected_body, rtol=1e-4, atol=1e-5)
-                    max_body_error = max(max_body_error, float(np.max(np.abs(actual - expected_body))))
-                report['validation']['opengl_body_max_abs_error'] = max_body_error
+            # Verify local-output GPU skinning against the original TensorFlow
+            # model for both meshes, and independent display FK at keyframes.
+            reset()
+            body_error = cloth_error = fk_error = 0.0
+            for i, (p, t) in enumerate(device_frames[:32]):
+                local, matrices, _ = step(p, t)
+                expected_body = model.lbs_body(model.body.vertices, matrices).numpy()[0, 0]
+                expected_cloth = model.lbs_cloth(local, tf.gather(matrices, model.body.input_joints, axis=-3)).numpy()[0, 0]
+                display_matrices = skeleton.matrices(poses[i + 2], trans[i + 2])
+                np.testing.assert_allclose(display_matrices, matrices.numpy()[0, 0], rtol=1e-4, atol=1e-5)
+                fk_error = max(fk_error, float(np.max(np.abs(display_matrices - matrices.numpy()[0, 0]))))
+                renderer.upload_local_pair(local.numpy(), local.numpy())
+                renderer.upload_display(display_matrices, 0)
+                renderer.update_mesh()
+                for mesh, expected, label in zip(renderer.meshes, (expected_body, expected_cloth), ('body', 'cloth')):
+                    actual = np.frombuffer(mesh[0].read(), dtype='f4').reshape(-1, 6)[:, :3]
+                    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+                    error = float(np.max(np.abs(actual - expected)))
+                    if label == 'body':
+                        body_error = max(body_error, error)
+                    else:
+                        cloth_error = max(cloth_error, error)
+            report['validation'].update(opengl_body_max_abs_error=body_error,
+                                        opengl_cloth_max_abs_error=cloth_error,
+                                        display_fk_max_abs_error=fk_error)
             info = renderer.ctx.info
-            renderer_name = info.get('GL_RENDERER', 'unknown')
-            software = is_software_renderer(renderer_name)
-            report.update(opengl={key: info.get(key) for key in
-                                  ('GL_VENDOR', 'GL_RENDERER', 'GL_VERSION')},
-                          software_renderer=software, window_size=[args.width, args.height],
-                          vsync_requested=args.vsync,
+            report.update(opengl={key: info.get(key) for key in ('GL_VENDOR', 'GL_RENDERER', 'GL_VERSION')},
+                          software_renderer=is_software_renderer(info.get('GL_RENDERER', '')),
+                          window_size=[args.width, args.height], vsync_requested=args.vsync,
                           ui_enabled=args.ui, playback_speed_initial=args.speed,
                           renderer_init_ms=renderer_init_ms,
-                          timing_notes='Wall clock; input sampling/upload included in inference_wait '
-                          'for interpolated mode; otherwise source inputs device resident. '
-                          'inference reads cloth+bone matrices (OpenGL body) or body+cloth (TF body). '
-                          'GPU mesh query covers skinning/normals; draw query covers clear/draw/UI, '
-                          'not upload or presentation; worker/render stages overlap when pipeline=true. '
-                          'Processing includes waiting for inference/reset, excludes pacing '
-                          'and delayed query collection. Swap is not screen presentation.')
-            print(f'OpenGL renderer: {renderer_name}; software={software}', flush=True)
-            # Warm up the complete path, including buffer updates and drawing.
-            for index in range(args.warmup):
-                if index % count == 0:
-                    reset()
-                output = step(*device_frames[index % count])
-                if gpu_body:
-                    cloth, matrices = output[0].numpy()[0, 0], output[1].numpy()
-                    body = None
-                else:
-                    body, cloth = output[0].numpy()[0, 0], output[1].numpy()[0, 0]
-                    matrices = None
-                bn = vertex_normals(body, model.body.faces) if args.normals == 'cpu' else None
-                cn = vertex_normals(cloth, model.garment.faces) if args.normals == 'cpu' else None
-                renderer.upload(body, cloth, bn, cn, matrices=matrices)
-                renderer.update_normals()
-                renderer.draw()
-                renderer.swap()
-                renderer.glfw.poll_events()
-                if renderer.glfw.window_should_close(renderer.window):
-                    break
-            renderer.ctx.finish()
-            renderer.frame_times.clear()
-            reset()
+                          timing_notes='Inference: cached fixed-step features/network/local cloth readback; '
+                          'no TensorFlow cloth skinning. Inference samples exclude frames without model ticks. '
+                          'Display: CPU pose SLERP/FK; GPU local cloth interpolation, body/cloth LBS and normals. '
+                          'Processing excludes UI build and delayed query collection. CPU/GPU stages overlap; '
+                          'swap completion is not screen presentation. Realtime draw FPS is not model throughput.')
+            print(f'OpenGL renderer: {info.get("GL_RENDERER")}', flush=True)
 
             def compute_frame(index):
                 with tf.device(device):
@@ -448,247 +340,133 @@ def main():
                     if index == 0:
                         reset()
                     infer_started = time.perf_counter()
-                    output = step(*device_frames[index])
-                    if gpu_body:
-                        cloth, matrices = output[0].numpy()[0, 0], output[1].numpy()
-                        body = None
-                    else:
-                        body, cloth = output[0].numpy()[0, 0], output[1].numpy()[0, 0]
-                        matrices = None
-                    infer_finished = time.perf_counter()
-                    return (body, cloth, matrices, infer_started, infer_finished,
-                            (infer_started - reset_started) * 1000)
+                    local, matrices, _ = step(*device_frames[index])
+                    local, matrices = local.numpy()[0, 0], matrices.numpy()[0, 0]
+                    if not (np.isfinite(local).all() and np.isfinite(matrices).all()):
+                        raise RuntimeError('Non-finite inference result')
+                    return InferenceFrame(local, matrices, infer_started, time.perf_counter(),
+                                          (infer_started - reset_started) * 1000)
 
-            if report['pipeline']:
-                # Compare the worker against the serial path, including a clip
-                # boundary. No OpenGL calls occur in the worker.
-                check_indices = list(range(min(count, 32))) + [0, 1 % count]
-                expected = [compute_frame(i)[:3] for i in check_indices]
-                pipeline = FramePrefetch(compute_frame)
-                max_pipeline_error = 0.0
-                for i, reference in enumerate(expected):
-                    actual = pipeline.take(check_indices[i])[:3]
-                    if i + 1 < len(check_indices):
-                        pipeline.prefetch(check_indices[i + 1])
-                    for a, b in zip(actual, reference):
-                        if a is not None:
-                            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
-                            max_pipeline_error = max(max_pipeline_error, float(np.max(np.abs(a - b))))
-                report['validation']['pipeline_max_abs_error'] = max_pipeline_error
-                reset()
-            index = 0
-            next_due = time.perf_counter()
+            for index in range(args.warmup):
+                frame = compute_frame(index % count)
+                renderer.upload_local_pair(frame.local, frame.local)
+                renderer.upload_display(frame.matrices, 0)
+                renderer.update_mesh()
+                renderer.draw()
+                renderer.swap()
+                renderer.glfw.poll_events()
+                if renderer.glfw.window_should_close(renderer.window):
+                    break
+            renderer.ctx.finish()
+            renderer.frame_times.clear()
+            renderer.fps = None
+            reset()
             last_frame = None
-            started = time.perf_counter()
-            last_title = started
-            last_memory = started
-            report['memory_samples'] = [memory_sample(tf, device, 0)]
-            report['completed'] = False
-            report['total_frames'] = 0
-            report['simulation_steps'] = 0
-            rendered_frames = 0
-            was_paused = renderer.paused
-            last_speed = renderer.playback_speed
-            animation_time = 0.0
-            last_clock = started
-            animation_loop = 0
-            committed_index = -1
-            report['committed_model_steps'] = 0
-            loop_duration = count * config.time_step
+            started = last_memory = time.perf_counter()
+            clock = PlaybackClock(started)
+            playback = FixedStepPlayback(count, config.time_step, compute_frame)
+            previous_pair = None
+            report.update(memory_samples=[memory_sample(tf, device, 0)], completed=False,
+                          total_frames=0, simulation_steps=0)
             while not renderer.glfw.window_should_close(renderer.window):
                 event_started = time.perf_counter()
                 renderer.glfw.poll_events()
                 if renderer.ui:
-                    renderer.ui.state.update(mode=args.mode,
-                                             animation_time=(animation_time if args.mode == 'interpolated'
-                                                             else index * config.time_step),
-                                             model_fps=config.data.fps)
+                    renderer.ui.state.update(animation_time=clock.time,
+                                             model_fps=1 / config.time_step,
+                                             display_delay_ms=report['display_delay_animation_ms'])
                 renderer.begin_ui()
                 event_done = time.perf_counter()
-                if args.duration is not None and time.perf_counter() - started >= args.duration:
-                    report['completed'] = True
-                    report['stop_reason'] = 'duration'
+                if args.duration is not None and event_done - started >= args.duration:
+                    report.update(completed=True, stop_reason='duration')
                     break
                 if renderer.restart:
-                    if pipeline:
-                        pipeline.discard()
-                    else:
-                        reset()
-                    index = 0
-                    next_due = time.perf_counter()
-                    animation_time = 0.0
-                    animation_loop = 0
-                    committed_index = -1
-                    last_clock = next_due
+                    reset()
+                    previous_pair = None
+                    clock = PlaybackClock(event_done)
+                    playback = FixedStepPlayback(count, config.time_step, compute_frame)
                     renderer.restart = False
-                    renderer.single_step = renderer.paused
-                if args.mode == 'benchmark' and args.iterations and report['total_frames'] >= args.iterations:
-                    report['completed'] = True
-                    break
-                now = time.perf_counter()
-                if args.mode == 'interpolated':
-                    if not was_paused and not renderer.paused:
-                        animation_time += (now - last_clock) * renderer.playback_speed
-                    if renderer.single_step:
-                        animation_time += config.time_step
-                    last_clock = now
-                if was_paused and not renderer.paused:
-                    next_due = now
-                if args.mode == 'realtime' and renderer.playback_speed != last_speed:
-                    next_due = now
-                last_speed = renderer.playback_speed
-                was_paused = renderer.paused
-                ready = renderer.single_step or (not renderer.paused and
-                    (args.mode in ('benchmark', 'interpolated') or now >= next_due))
-                if not ready:
-                    renderer.draw()
-                    renderer.swap()
-                    rendered_frames += 1
-                    if renderer.paused:
-                        renderer.glfw.wait_events_timeout(0.005)
-                    continue
+                step_amount = (config.time_step + max(0, config.time_step - clock.time)
+                               if renderer.single_step else 0)
+                animation_time = clock.tick(event_done, renderer.paused, renderer.playback_speed, step_amount)
                 frame_started = time.perf_counter()
-                input_done = time.perf_counter()
-                sample_upload_ms = 0.0
-                steps = (playback_steps(now, next_due, config.time_step / renderer.playback_speed)
-                         if args.mode == 'realtime' and not renderer.single_step else 1)
-                for tick in range(steps):
-                    if args.mode == 'interpolated':
-                        loop = int(animation_time / loop_duration)
-                        sample_time = animation_time % loop_duration
-                        sample_reset_ms = 0.0
-                        if loop != animation_loop:
-                            reset_started = time.perf_counter()
-                            reset()
-                            sample_reset_ms = (time.perf_counter() - reset_started) * 1000
-                            animation_loop = loop
-                            committed_index = -1
-                        index = min(count - 1, int(sample_time / config.time_step))
-                        # Only complete grid frames advance the persistent GRU.
-                        # Fractional previews use the state before their grid frame.
-                        while committed_index < index - 1:
-                            committed_index += 1
-                            step(*device_frames[committed_index])[-1].numpy()
-                            report['committed_model_steps'] += 1
-                        sample_started = time.perf_counter()
-                        history_times = sample_time + np.arange(-2, 1) * config.time_step
-                        sampled = [sample_interpolated_motion(sequence, seconds) for seconds in history_times]
-                        sampled_pose = np.concatenate([value[0] for value in sampled], axis=0)
-                        sampled_trans = np.concatenate([value[1] for value in sampled], axis=0)
-                        p, t = tf.constant(sampled_pose[None]), tf.constant(sampled_trans[None])
-                        sample_upload_ms = (time.perf_counter() - sample_started) * 1000
-                        infer_start = time.perf_counter()
-                        output = preview_step(p, t)
-                        if gpu_body:
-                            cloth, matrices = output[0].numpy()[0, 0], output[1].numpy()
-                            body = None
-                        else:
-                            body, cloth = output[0].numpy()[0, 0], output[1].numpy()[0, 0]
-                            matrices = None
-                        result = body, cloth, matrices, infer_start, time.perf_counter(), sample_reset_ms
-                    else:
-                        result = pipeline.take(index) if pipeline else compute_frame(index)
-                    if tick + 1 < steps:
-                        index = (index + 1) % count
-                body, cloth, matrices, infer_started, infer_finished, reset_ms = result
+                previous, current, alpha, source_time, computed = playback.sample(animation_time)
                 inference_done = time.perf_counter()
-                if not (np.isfinite(matrices if gpu_body else body).all() and np.isfinite(cloth).all()):
-                    raise RuntimeError('Non-finite predicted vertices')
-                bn = vertex_normals(body, model.body.faces) if args.normals == 'cpu' else None
-                cn = vertex_normals(cloth, model.garment.faces) if args.normals == 'cpu' else None
-                normals_done = time.perf_counter()
-                renderer.upload(body, cloth, bn, cn, matrices=matrices)
+                pair = (id(previous), id(current))
+                if pair != previous_pair:
+                    renderer.upload_local_pair(previous.local, current.local)
+                    previous_pair = pair
+                pair_uploaded = time.perf_counter()
+                pose, translation = sample_interpolated_motion(sequence, source_time)
+                matrices = skeleton.matrices(pose, translation)
+                pose_done = time.perf_counter()
+                renderer.upload_display(matrices, alpha)
                 upload_done = time.perf_counter()
-                normal_query = renderer.update_normals(measure=True)
+                normal_query = renderer.update_mesh(measure=True)
                 normal_submit_done = time.perf_counter()
                 query = renderer.draw(measure=True)
                 draw_done = time.perf_counter()
-                # Let inference run while the native swap call releases the
-                # GIL. Starting during Python GL submission caused contention.
-                if pipeline and not (args.iterations and report['total_frames'] + 1 >= args.iterations):
-                    pipeline.prefetch((index + 1) % count)
-                prefetch_done = time.perf_counter()
                 renderer.swap()
-                rendered_frames += 1
                 finished = time.perf_counter()
-                row = {'sample': report['total_frames'], 'clip_frame': index,
-                       'steps_advanced': steps,
-                       'animation_time_s': animation_time if args.mode == 'interpolated' else None,
-                       'sample_upload_ms': sample_upload_ms,
-                       'playback_speed': renderer.playback_speed,
-                       'vsync_requested': renderer.vsync,
+                model_times = [(f.finished - f.started) * 1000 for f in computed]
+                row = {'sample': report['total_frames'], 'clip_frame': playback.index,
+                       'steps_advanced': len(computed), 'animation_time_s': animation_time,
+                       'display_time_s': max(0, animation_time - config.time_step),
+                       'source_time_s': source_time, 'interpolation_alpha': alpha,
+                       'playback_speed': renderer.playback_speed, 'vsync_requested': renderer.vsync,
                        'width': renderer.ctx.viewport[2], 'height': renderer.ctx.viewport[3],
                        'event_poll_ms': (event_done - event_started) * 1000,
                        'query_collect_ms': 0.0,
-                       'input_upload_ms': (input_done - frame_started) * 1000,
-                       'inference_readback_ms': (infer_finished - infer_started) * 1000,
-                       'inference_wait_ms': (inference_done - input_done) * 1000,
-                       'clip_reset_ms': reset_ms,
-                       'prefetch_age_ms': max(0, (inference_done - infer_finished) * 1000),
-                       'normals_ms': (normals_done - inference_done) * 1000,
-                       'vertex_upload_cpu_ms': (upload_done - normals_done) * 1000,
+                       'inference_readback_ms': float(np.mean(model_times)) if model_times else None,
+                       'inference_samples_ms': model_times,
+                       'inference_total_ms': sum(model_times),
+                       'inference_wait_ms': (inference_done - frame_started) * 1000,
+                       'clip_reset_ms': sum(f.reset_ms for f in computed),
+                       'display_pose_ms': (pose_done - pair_uploaded) * 1000,
+                       'vertex_upload_cpu_ms': (pair_uploaded - inference_done + upload_done - pose_done) * 1000,
                        'mesh_update_submit_cpu_ms': (normal_submit_done - upload_done) * 1000,
                        'draw_submit_cpu_ms': (draw_done - normal_submit_done) * 1000,
-                       'prefetch_submit_ms': (prefetch_done - draw_done) * 1000,
-                       'swap_ms': (finished - prefetch_done) * 1000,
+                       'swap_ms': (finished - draw_done) * 1000,
                        'processing_ms': (finished - frame_started) * 1000,
-                       'inference_to_swap_ms': (finished - infer_started) * 1000,
                        'update_interval_ms': None if last_frame is None else (finished - last_frame) * 1000,
                        'gpu_draw_ms': None, 'gpu_mesh_update_ms': None}
                 samples.append(row)
                 report['total_frames'] += 1
-                report['simulation_steps'] += steps
+                report['simulation_steps'] += len(computed)
                 if query is not None:
                     pending.append((row, query, normal_query))
                 collect_started = time.perf_counter()
                 if len(pending) > 4:
-                    old, old_query, old_normal_query = pending.popleft()
+                    old, old_query, old_normal = pending.popleft()
                     old['gpu_draw_ms'] = old_query.elapsed / 1e6
-                    if old_normal_query is not None:
-                        old['gpu_mesh_update_ms'] = old_normal_query.elapsed / 1e6
+                    old['gpu_mesh_update_ms'] = old_normal.elapsed / 1e6
                 row['query_collect_ms'] = (time.perf_counter() - collect_started) * 1000
                 if renderer.ui:
                     renderer.ui.history.append(row)
                 last_frame = finished
-                if args.mode != 'interpolated':
-                    index = (index + 1) % count
                 renderer.single_step = False
                 if renderer.paused:
-                    next_due = finished + config.time_step / renderer.playback_speed
-                else:
-                    next_due += steps * config.time_step / renderer.playback_speed
-                if finished - last_title >= 0.5:
-                    recent = list(samples)[-30:]
-                    intervals = [x['update_interval_ms'] for x in recent if x['update_interval_ms']]
-                    hz = 1000 / np.mean(intervals) if intervals else 0
-                    renderer.title(f'NCS | frame {row["clip_frame"]}/{count} | {hz:.1f} updates/s | '
-                                   f'{row["processing_ms"]:.2f} ms | {args.mode}')
-                    last_title = finished
+                    renderer.glfw.wait_events_timeout(0.005)
                 if finished - last_memory >= 30:
                     report['memory_samples'].append(memory_sample(tf, device, finished - started))
                     last_memory = finished
             report['session_wall_seconds'] = time.perf_counter() - started
-            report['playback_speed_final'] = renderer.playback_speed
-            report['vsync_final'] = renderer.vsync
-            report['rendered_frames'] = rendered_frames
-            report['render_fps'] = rendered_frames / report['session_wall_seconds']
-            report['simulation_updates_per_second'] = report['simulation_steps'] / report['session_wall_seconds']
+            report.update(playback_speed_final=renderer.playback_speed, vsync_final=renderer.vsync,
+                          animation_time_s=clock.time,
+                          rendered_frames=report['total_frames'],
+                          render_fps=report['total_frames'] / report['session_wall_seconds'],
+                          simulation_updates_per_second=report['simulation_steps'] / report['session_wall_seconds'])
             report['memory_samples'].append(memory_sample(tf, device, report['session_wall_seconds']))
         finally:
-            try:
-                if pipeline:
-                    pipeline.close()
-            finally:
-                if renderer:
-                    try:
-                        while pending:
-                            row, query, normal_query = pending.popleft()
-                            row['gpu_draw_ms'] = query.elapsed / 1e6
-                            if normal_query is not None:
-                                row['gpu_mesh_update_ms'] = normal_query.elapsed / 1e6
-                        save_report(args, report, samples, np)
-                    finally:
-                        renderer.close()
+            if renderer:
+                try:
+                    while pending:
+                        row, query, normal_query = pending.popleft()
+                        row['gpu_draw_ms'] = query.elapsed / 1e6
+                        row['gpu_mesh_update_ms'] = normal_query.elapsed / 1e6
+                    save_report(args, report, samples, np)
+                finally:
+                    renderer.close()
 
 
 if __name__ == '__main__':

@@ -61,7 +61,8 @@ python -m pip install -r requirements-gpu.txt
 
 ## 实时可视化
 
-逐帧推理可直接用 ModernGL + GLFW 查看器显示，无需 Blender 或 PC2 文件。
+固定步长推理可直接用 ModernGL + GLFW 查看器显示，无需 Blender 或 PC2 文件。
+默认原速播放，显示帧在局部空间插值衣物形变并在 GPU 蒙皮，模型更新与显示 FPS 分开。
 可选渲染依赖包含 Dear ImGui 面板，用于 FPS、播放速度控制和性能统计：
 
 ```bash

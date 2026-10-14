@@ -11,8 +11,8 @@ class PerformanceHistory:
         ('processing_ms', 'Frame processing'),
         ('event_poll_ms', 'Events + UI build'),
         ('inference_readback_ms', 'Inference + readback'),
-        ('inference_wait_ms', 'Wait for inference'),
-        ('sample_upload_ms', 'Input interpolation'),
+        ('inference_wait_ms', 'Model tick wait'),
+        ('display_pose_ms', 'Display SLERP / FK'),
         ('vertex_upload_cpu_ms', 'Upload'),
         ('mesh_update_submit_cpu_ms', 'Mesh submission'),
         ('draw_submit_cpu_ms', 'Draw submission'),
@@ -37,12 +37,16 @@ class PerformanceHistory:
         self.updated = now
         result = {}
         for key, _ in self.FIELDS:
-            values = [row[key] for _, row in self.samples if row.get(key) is not None]
+            values = [value for _, row in self.samples
+                      for value in (row.get('inference_samples_ms', [row.get(key)])
+                                    if key == 'inference_readback_ms' else [row.get(key)])
+                      if value is not None]
             if values:
                 result[key] = (float(np.mean(values)), float(np.percentile(values, 95)))
-        recent = [stamp for stamp, _ in self.samples if now - stamp <= 1]
-        result['inference_hz'] = ((len(recent) - 1) / (recent[-1] - recent[0])
-                                  if len(recent) > 1 and recent[-1] > recent[0] else 0.0)
+        recent = [(stamp, row) for stamp, row in self.samples if now - stamp <= 1]
+        result['inference_hz'] = (sum(row.get('steps_advanced', 1) for _, row in recent[1:]) /
+                                  (recent[-1][0] - recent[0][0])
+                                  if len(recent) > 1 and recent[-1][0] > recent[0][0] else 0.0)
         self.cached = result
         return result
 
@@ -92,13 +96,12 @@ class ViewerUI:
         ui.new_frame()
         self.prepared = True
         ui.set_next_window_position(12, 12, condition=ui.FIRST_USE_EVER)
-        ui.set_next_window_size(430, 610, condition=ui.FIRST_USE_EVER)
+        ui.set_next_window_size(450, 660, condition=ui.FIRST_USE_EVER)
         ui.begin('NeuralClothSim | Performance')
         fps = owner.fps or 0.0
         ui.text(f'FPS: {fps:.1f}    Frame: {1000 / fps if fps else 0:.2f} ms')
         stats = self.history.snapshot()
         ui.text(f'Inference: {0 if owner.paused else stats.get("inference_hz", 0):.1f} / s')
-        ui.text(f'Mode: {self.state.get("mode", "initializing")}')
         ui.separator()
         if ui.button('Resume' if owner.paused else 'Pause'):
             owner.paused = not owner.paused
@@ -108,16 +111,19 @@ class ViewerUI:
         ui.same_line()
         if ui.button('Step'):
             owner.paused, owner.single_step = True, True
-        if self.state.get('mode') != 'benchmark':
-            changed, speed = ui.slider_float('Playback speed', owner.playback_speed, 0.1, 4.0, '%.2fx')
-            if changed:
-                owner.playback_speed = speed
-            if ui.button('Reset speed (1x)'):
-                owner.playback_speed = 1.0
-        else:
-            ui.text_disabled('Benchmark: unpaced; playback speed ignored')
+        changed, speed = ui.slider_float('Playback speed', owner.playback_speed, 0.1, 4.0, '%.2fx')
+        if changed:
+            owner.playback_speed = speed
+        if ui.button('Reset speed (1x)'):
+            owner.playback_speed = 1.0
         ui.text(f'Animation: {self.state.get("animation_time", 0):.2f} s')
         ui.text(f'Model step: {self.state.get("model_fps", 0):g} Hz (fixed)')
+        ui.text(f'Display delay: {self.state.get("display_delay_ms", 0):.1f} animation ms')
+        inference = stats.get('inference_readback_ms')
+        if inference and inference[0] > 0:
+            budget = 1000 / max(self.state.get('model_fps', 30), 1e-6)
+            ui.text(f'Model budget used: {100 * inference[0] / budget:.1f}%')
+            ui.text(f'Serial step estimate: {1000 / inference[0]:.0f} / s')
         changed, wireframe = ui.checkbox('Wireframe', owner.wireframe)
         if changed:
             owner.wireframe = wireframe
@@ -148,7 +154,8 @@ class ViewerUI:
             ui.text(f'{values[1]:.3f}' if values else '--')
             ui.next_column()
         ui.columns(1)
-        ui.text_disabled('Last 240 updates; CPU / GPU stages overlap.')
+        ui.text_disabled('Last 240 draws; inference excludes idle draws.')
+        ui.text_disabled('Serial estimate excludes rendering / scheduling.')
         ui.separator()
         ui.text_wrapped(owner.ctx.info.get('GL_RENDERER', 'Unknown GPU'))
         ui.text_disabled('Drag outside panel: orbit | Wheel: zoom')

@@ -6,18 +6,6 @@ from collections import deque
 import numpy as np
 
 
-def vertex_normals(vertices, faces):
-    triangles = vertices[faces]
-    normals = np.cross(triangles[:, 1] - triangles[:, 0],
-                       triangles[:, 2] - triangles[:, 0])
-    indices = faces.ravel()
-    values = np.repeat(normals, 3, axis=0)
-    result = np.column_stack([np.bincount(indices, weights=values[:, axis],
-                                          minlength=len(vertices)) for axis in range(3)])
-    result /= np.maximum(np.linalg.norm(result, axis=1, keepdims=True), 1e-12)
-    return result.astype('f4')
-
-
 def camera_matrix(center, radius, yaw, pitch, aspect):
     direction = np.array([math.cos(pitch) * math.sin(yaw), math.sin(pitch),
                           math.cos(pitch) * math.cos(yaw)], dtype='f4')
@@ -69,11 +57,8 @@ layout(std430, binding=0) buffer Mesh { float data[]; };
 layout(std430, binding=1) readonly buffer Faces { uint faces[]; };
 layout(std430, binding=2) readonly buffer Offsets { uint offsets[]; };
 layout(std430, binding=3) readonly buffer Adjacency { uint adjacent[]; };
-layout(std430, binding=4) readonly buffer Positions { float positions[]; };
 uniform uint vertex_count;
-uniform bool use_input;
 vec3 position(uint i) {
-    if (use_input) return vec3(positions[3*i], positions[3*i+1], positions[3*i+2]);
     return vec3(data[6*i], data[6*i+1], data[6*i+2]);
 }
 void main() {
@@ -86,10 +71,6 @@ void main() {
         n += cross(position(faces[f+1])-a, position(faces[f+2])-a);
     }
     n /= max(length(n), 1e-12);
-    if (use_input) {
-        vec3 p = position(i);
-        data[6*i]=p.x; data[6*i+1]=p.y; data[6*i+2]=p.z;
-    }
     data[6*i+3]=n.x; data[6*i+4]=n.y; data[6*i+5]=n.z;
 }
 '''
@@ -101,12 +82,15 @@ layout(std430, binding=0) buffer Mesh { float data[]; };
 layout(std430, binding=1) readonly buffer Rest { float rest[]; };
 layout(std430, binding=2) readonly buffer Weights { float weights[]; };
 layout(std430, binding=3) readonly buffer Matrices { float matrices[]; };
+layout(std430, binding=4) readonly buffer NextRest { float next_rest[]; };
 uniform uint vertex_count;
 uniform uint joint_count;
+uniform float alpha;
 void main() {
     uint i=gl_GlobalInvocationID.x;
     if (i>=vertex_count) return;
     vec3 p=vec3(rest[3*i],rest[3*i+1],rest[3*i+2]);
+    p=mix(p,vec3(next_rest[3*i],next_rest[3*i+1],next_rest[3*i+2]),alpha);
     // Match TensorFlow LBS: blend matrices first, then transform the vertex.
     float m[12];
     for (uint k=0; k<12; ++k) m[k]=0;
@@ -149,8 +133,8 @@ class GLFWLoader:
 
 
 class Renderer:
-    def __init__(self, body, cloth, body_faces, cloth_faces, width, height, vsync,
-                 normals='gpu', require_hardware=True, body_rest=None, body_weights=None,
+    def __init__(self, body, cloth, body_faces, cloth_faces, width, height, vsync, *,
+                 body_rest, body_weights, cloth_weights, require_hardware=True,
                  ui=True, playback_speed=1.0):
         import glfw
         import moderngl
@@ -163,15 +147,12 @@ class Renderer:
         self.playback_speed = playback_speed
         self.vsync = vsync
         self.normal_buffers = []
-        self.position_buffers = []
-        self.skin_buffers = None
-        self.normals = normals
         self.frame_times = deque(maxlen=120)
         self.last_fps_update = 0
         if not glfw.init():
             raise RuntimeError('GLFW initialization failed. Check DISPLAY/Wayland and GPU drivers.')
         try:
-            glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4 if normals == 'gpu' else 3)
+            glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
             glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
             glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
             self.window = glfw.create_window(width, height, 'NCS realtime viewer', None, None)
@@ -179,7 +160,7 @@ class Renderer:
                 raise RuntimeError('Could not create the required OpenGL window (GPU normals require 4.3).')
             glfw.make_context_current(self.window)
             glfw.swap_interval(int(vsync))
-            self.ctx = moderngl.create_context(require=430 if normals == 'gpu' else 330,
+            self.ctx = moderngl.create_context(require=430,
                                               context=GLFWLoader(glfw))
             name = self.ctx.info.get('GL_RENDERER', 'unknown')
             if require_hardware and is_software_renderer(name):
@@ -189,9 +170,8 @@ class Renderer:
             self.program = self.ctx.program(vertex_shader=VERTEX_SHADER,
                                             fragment_shader=FRAGMENT_SHADER)
             self.resources.append(self.program)
-            if normals == 'gpu':
-                self.normal_program = self.ctx.compute_shader(NORMAL_SHADER)
-                self.resources.append(self.normal_program)
+            self.normal_program = self.ctx.compute_shader(NORMAL_SHADER)
+            self.resources.append(self.normal_program)
             self.meshes = []
             for vertices, faces, color in ((body, body_faces, (0.65, 0.65, 0.65)),
                                             (cloth, cloth_faces, (0.25, 0.45, 0.95))):
@@ -204,24 +184,23 @@ class Renderer:
                     [(buffer, '3f 3f', 'position', 'normal')], indices)
                 self.resources.extend([buffer, indices, vao])
                 self.meshes.append((buffer, vao, color))
-                if normals == 'gpu':
-                    offsets, adjacent = normal_adjacency(faces, len(vertices))
-                    offsets_buffer = self.ctx.buffer(offsets.tobytes())
-                    adjacent_buffer = self.ctx.buffer(adjacent.tobytes())
-                    self.resources.extend([offsets_buffer, adjacent_buffer])
-                    self.normal_buffers.append((indices, offsets_buffer, adjacent_buffer, len(vertices)))
-                    positions = self.ctx.buffer(reserve=len(vertices) * 3 * 4)
-                    self.position_buffers.append(positions)
-                    self.resources.append(positions)
-            if body_rest is not None:
-                self.skin_program = self.ctx.compute_shader(SKIN_SHADER)
-                rest = self.ctx.buffer(np.asarray(body_rest, dtype='f4').tobytes())
-                weights = self.ctx.buffer(np.asarray(body_weights, dtype='f4').tobytes())
-                matrices = self.ctx.buffer(reserve=body_weights.shape[1] * 12 * 4)
-                self.skin_buffers = (rest, weights, matrices)
-                self.skin_program['vertex_count'].value = len(body_rest)
-                self.skin_program['joint_count'].value = body_weights.shape[1]
-                self.resources.extend([self.skin_program, rest, weights, matrices])
+                offsets, adjacent = normal_adjacency(faces, len(vertices))
+                offsets_buffer = self.ctx.buffer(offsets.tobytes())
+                adjacent_buffer = self.ctx.buffer(adjacent.tobytes())
+                self.resources.extend([offsets_buffer, adjacent_buffer])
+                self.normal_buffers.append((indices, offsets_buffer, adjacent_buffer, len(vertices)))
+            self.skin_program = self.ctx.compute_shader(SKIN_SHADER)
+            rest = self.ctx.buffer(np.asarray(body_rest, dtype='f4').tobytes())
+            weights = self.ctx.buffer(np.asarray(body_weights, dtype='f4').tobytes())
+            matrices = self.ctx.buffer(reserve=body_weights.shape[1] * 12 * 4)
+            self.skin_buffers = (rest, weights, matrices)
+            self.skin_program['joint_count'].value = body_weights.shape[1]
+            previous = self.ctx.buffer(reserve=len(cloth) * 3 * 4)
+            following = self.ctx.buffer(reserve=len(cloth) * 3 * 4)
+            cloth_weights_buffer = self.ctx.buffer(np.asarray(cloth_weights, dtype='f4').tobytes())
+            self.cloth_skin_buffers = (previous, cloth_weights_buffer, matrices, following)
+            self.resources.extend([self.skin_program, rest, weights, matrices,
+                                   previous, following, cloth_weights_buffer])
             lo, hi = body.min(axis=0), body.max(axis=0)
             self.center = (lo + hi) / 2
             self.radius = max(float(np.linalg.norm(hi - lo)) * 1.6, 0.1)
@@ -248,10 +227,10 @@ class Renderer:
             glfw.set_key_callback(self.window, self._key)
             glfw.set_cursor_pos_callback(self.window, self._cursor)
             glfw.set_scroll_callback(self.window, self._scroll)
-            self.upload(body, cloth, vertex_normals(body, body_faces),
-                        vertex_normals(cloth, cloth_faces))
-            self.update_normals()
-            self.skin_pending = False
+            self.upload_local_pair(cloth, cloth)
+            identity = np.tile(np.eye(4, dtype='f4')[:3], (body_weights.shape[1], 1, 1))
+            self.upload_display(identity, 0)
+            self.update_mesh()
         except Exception:
             self.close()
             raise
@@ -289,45 +268,24 @@ class Renderer:
                 return
         self.radius = float(np.clip(self.radius * math.exp(-dy * 0.1), 0.02, 1e4))
 
-    def upload(self, body, cloth, body_normals=None, cloth_normals=None, matrices=None):
-        self.skin_pending = matrices is not None
-        if matrices is not None:
-            self.skin_buffers[2].orphan()
-            self.skin_buffers[2].write(np.asarray(matrices, dtype='f4').tobytes())
-        for index, ((buffer, _, _), vertices, normals) in enumerate(zip(self.meshes, (body, cloth),
-                                                     (body_normals, cloth_normals))):
-            if vertices is None:
-                continue
-            if self.normals == 'gpu':
-                position_buffer = self.position_buffers[index]
-                position_buffer.orphan()
-                position_buffer.write(np.asarray(vertices, dtype='f4').tobytes())
-                continue
-            data = np.empty((len(vertices), 6), dtype='f4')
-            data[:, :3] = vertices
-            data[:, 3:] = normals if normals is not None else 0
-            # Rename backing storage so writes do not wait for the previous
-            # frame's compute/draw to stop reading this buffer (notably D3D12).
-            buffer.orphan()
-            buffer.write(data.tobytes())
-
-    def update_normals(self, measure=False):
-        if self.normals != 'gpu':
-            return None
+    def update_mesh(self, measure=False):
+        """Interpolate local cloth, skin both meshes, then generate normals."""
         query = self.ctx.query(time=True) if measure else None
         if query:
             query.__enter__()
         try:
-            if self.skin_pending:
-                for binding, buffer in enumerate((self.meshes[0][0], *self.skin_buffers)):
+            skin_inputs = ((*self.skin_buffers, self.skin_buffers[0]), self.cloth_skin_buffers)
+            for index, (mesh, buffers) in enumerate(zip(self.meshes, skin_inputs)):
+                for binding, buffer in enumerate((mesh[0], *buffers)):
                     buffer.bind_to_storage_buffer(binding)
-                self.skin_program.run(group_x=(self.normal_buffers[0][3] + 127) // 128)
-                self.ctx.memory_barrier(self.gl.SHADER_STORAGE_BARRIER_BIT)
-            for index, (mesh, (faces, offsets, adjacent, count)) in enumerate(zip(self.meshes, self.normal_buffers)):
+                count = self.normal_buffers[index][3]
+                self.skin_program['vertex_count'].value = count
+                self.skin_program['alpha'].value = self.interpolation_alpha if index else 0.0
+                self.skin_program.run(group_x=(count + 127) // 128)
+            self.ctx.memory_barrier(self.gl.SHADER_STORAGE_BARRIER_BIT)
+            for mesh, (faces, offsets, adjacent, count) in zip(self.meshes, self.normal_buffers):
                 for binding, buffer in enumerate((mesh[0], faces, offsets, adjacent)):
                     buffer.bind_to_storage_buffer(binding)
-                self.position_buffers[index].bind_to_storage_buffer(4)
-                self.normal_program['use_input'].value = not (index == 0 and self.skin_pending)
                 self.normal_program['vertex_count'].value = count
                 self.normal_program.run(group_x=(count + 127) // 128)
             self.ctx.memory_barrier(self.gl.VERTEX_ATTRIB_ARRAY_BARRIER_BIT |
@@ -336,9 +294,6 @@ class Renderer:
             if query:
                 query.__exit__(None, None, None)
         return query
-
-    def set_fps(self, fps):
-        self.fps = fps
 
     def begin_ui(self):
         if self.ui:
@@ -376,11 +331,20 @@ class Renderer:
         now = time.perf_counter()
         self.frame_times.append(now)
         if now - self.last_fps_update >= 0.25 and len(self.frame_times) > 1:
-            self.set_fps((len(self.frame_times) - 1) / (now - self.frame_times[0]))
+            self.fps = (len(self.frame_times) - 1) / (now - self.frame_times[0])
             self.last_fps_update = now
 
-    def title(self, text):
-        self.glfw.set_window_title(self.window, text)
+    def upload_local_pair(self, previous, following):
+        """Only upload cloth endpoints when a fixed model tick advances."""
+        for buffer, value in zip((self.cloth_skin_buffers[0], self.cloth_skin_buffers[3]),
+                                 (previous, following)):
+            buffer.orphan()
+            buffer.write(np.asarray(value, dtype='f4').tobytes())
+
+    def upload_display(self, matrices, alpha):
+        self.skin_buffers[2].orphan()
+        self.skin_buffers[2].write(np.asarray(matrices, dtype='f4').tobytes())
+        self.interpolation_alpha = alpha
 
     def close(self):
         if self.ui:

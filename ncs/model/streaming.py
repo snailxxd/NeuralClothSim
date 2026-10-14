@@ -59,44 +59,18 @@ class StreamingNCS(tf.Module):
     @tf.function(reduce_retracing=True)
     def step(self, poses, trans):
         """Return cloth and hidden, preserving the original streaming API."""
-        return self._step(poses, trans, include_body=False)
+        return self._step(poses, trans)
 
     @tf.function(reduce_retracing=True)
-    def step_with_body(self, poses, trans):
-        """Return (body, cloth, hidden), reusing the full-skeleton FK matrices."""
-        return self._step(poses, trans, include_body=True)
+    def step_local(self, poses, trans):
+        """Return local cloth vertices, full bone matrices and updated hidden.
 
-    @tf.function(reduce_retracing=True)
-    def step_for_render(self, poses, trans):
-        """Return (cloth, full bone matrices, hidden) for renderer-side body LBS."""
-        return self._step(poses, trans, include_body=False, return_matrices=True)
-
-    @tf.function(reduce_retracing=True)
-    def preview_for_render(self, poses, trans):
-        """Read-only prediction from three poses spaced by config.time_step.
-
-        Unlike step(), the preview never changes spatial caches or GRU state.
-        Commit complete model ticks with step() before previewing fractional time.
+        Renderers interpolate local vertices and skin at display time. No cloth
+        LBS is performed here; the fixed-step cache/GRU update is unchanged.
         """
-        return self._preview(poses, trans, include_body=False)
+        return self._step(poses, trans, return_local=True)
 
-    @tf.function(reduce_retracing=True)
-    def preview_with_body(self, poses, trans):
-        return self._preview(poses, trans, include_body=True)
-
-    def _preview(self, poses, trans, include_body):
-        tf.debugging.assert_equal(self.initialized, True, message="Call reset() before preview()")
-        tf.debugging.assert_equal(tf.shape(poses)[1], 3, message="preview() accepts three historical poses")
-        features, full_matrices = self.model.call_inputs(poses, trans)
-        network = getattr(self, "preview_network_step", self.network_step)
-        deformation, hidden = network(features, self.hidden.read_value())
-        matrices = tf.gather(full_matrices, self.model.body.input_joints, axis=-3)
-        cloth = self.model.lbs_cloth(self.model.garment.vertices + deformation, matrices)
-        if include_body:
-            return self.model.lbs_body(self.model.body.vertices, full_matrices), cloth, hidden
-        return cloth, full_matrices, hidden
-
-    def _step(self, poses, trans, include_body, return_matrices=False):
+    def _step(self, poses, trans, return_local=False):
         tf.debugging.assert_equal(self.initialized, True, message="Call reset() before step()")
         tf.debugging.assert_equal(tf.shape(poses)[1], 1, message="step() accepts one frame")
         x, j, full_matrices, inverse = self.model.call_spatial_inputs(poses, trans)
@@ -112,14 +86,12 @@ class StreamingNCS(tf.Module):
         dj = (inverse @ dj[..., None])[..., 0]
         features = tf.concat((x, dx, dj), axis=-1)
         deformation, hidden = self.network_step(features, self.hidden.read_value())
-        cloth = self.model.lbs_cloth(self.model.garment.vertices + deformation, matrices)
+        local = self.model.garment.vertices + deformation
         self.older_j.assign(self.previous_j)
         self.previous_j.assign(j)
         self.previous_x.assign(x)
         self.hidden.assign(hidden)
-        if return_matrices:
-            return cloth, full_matrices, hidden
-        if include_body:
-            body = self.model.lbs_body(self.model.body.vertices, full_matrices)
-            return body, cloth, hidden
+        if return_local:
+            return local, full_matrices, hidden
+        cloth = self.model.lbs_cloth(local, matrices)
         return cloth, hidden
