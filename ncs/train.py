@@ -55,11 +55,17 @@ def main(config):
         raise ValueError("initial_epoch must be an integer between 0 and epochs")
     if initial_epoch and config.experiment.checkpoint is None:
         raise ValueError("initial_epoch requires a checkpoint to resume from")
-    # Avoid overwriting artifacts from an existing experiment.
+    # An explicit same-name resume continues writing to the existing outputs.
+    # Other runs must use a new config name to protect their artifacts.
     log_dir = os.path.join(LOGS_DIR, config.name)
     checkpoint_dir = os.path.join(CHECKPOINTS_DIR, config.name)
     existing_dirs = [path for path in (log_dir, checkpoint_dir) if os.path.isdir(path)]
-    if existing_dirs:
+    resume_in_place = (
+        initial_epoch > 0
+        and config.experiment.checkpoint == config.name
+        and os.path.isfile(os.path.join(checkpoint_dir, "saved_model.pb"))
+    )
+    if existing_dirs and not resume_in_place:
         print(f"Experiment '{config.name}' cannot start because these output directories already exist:")
         for path in existing_dirs:
             print(f"  {path}")

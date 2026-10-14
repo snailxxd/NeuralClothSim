@@ -10,6 +10,11 @@
 使用 `python -m view_realtime --help` 查看全部参数；无窗口模型校验使用
 `python -m view_realtime --validate-only`。
 
+ImGui 面板的 `Motion` 滑块可在播放过程中调节动态布料强度（0–2），
+`Reset motion (1.0)` 恢复默认值。初始值由 `--motion` 指定。
+修改从下一个模型推理步生效，保留 GRU 历史；暂停时可点击 `Step` 查看效果。
+显示端的局部形变插值会带来最多约一个模型步的过渡延迟。
+
 模块文件：
 
 - `__main__.py`：模块启动入口。

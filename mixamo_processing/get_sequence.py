@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import bpy
@@ -9,16 +10,16 @@ from bpy_utils import init_scene, get_keyframes
 
 def main(file, dst):
     assert os.path.isfile(file), f"File does not exist: {file}"
-    assert os.path.isdir(
-        os.path.dirname(dst)
-    ), f"Folder does not exist: {os.path.dirname(dst)}"
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
 
     sc = init_scene()
     # Load FBX
     bpy.ops.import_scene.fbx(filepath=file)
 
     # Get reference to Armature
-    arm_ob = bpy.data.objects["Armature"]
+    armatures = [ob for ob in sc.objects if ob.type == "ARMATURE"]
+    assert len(armatures) == 1, f"Expected one armature, found {len(armatures)}"
+    arm_ob = armatures[0]
 
     s, e = get_keyframes(arm_ob)
     sc.frame_start, sc.frame_end = s, e
@@ -49,12 +50,16 @@ def main(file, dst):
         source=file.split(os.path.sep)[-1],
     )
 
-    sys.exit()
+    print(f"Exported {dst}: {Q.shape[0]} frames, {Q.shape[1]} bones")
 
 
 if __name__ == "__main__":
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parser = argparse.ArgumentParser(description="Export a Mixamo FBX animation to NPZ.")
+    parser.add_argument("--file", default=os.path.join(project_dir, "data", "mixamo", "Walking.fbx"))
+    parser.add_argument("--dst", default=os.path.join(project_dir, "data", "mixamo", "Walking.npz"))
+    args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
     main(
-        file=os.path.join(project_dir, "data", "mixamo", "Walking.fbx"),
-        dst=os.path.join(project_dir, "data", "mixamo", "Walking.npz"),
+        file=os.path.abspath(args.file),
+        dst=os.path.abspath(args.dst),
     )
