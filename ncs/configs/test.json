@@ -39,7 +39,7 @@
         "dataset": "mixamo",
         "train": "toy.txt",
         "validation": "toy.txt",
-        "test": "walking.txt",
+        "test": "toy.txt",
         "fps": 30
     },
     "model": {

@@ -6,13 +6,18 @@ from collections import deque
 import numpy as np
 
 
-def camera_matrix(center, radius, yaw, pitch, aspect):
+def camera_axes(yaw, pitch):
     direction = np.array([math.cos(pitch) * math.sin(yaw), math.sin(pitch),
                           math.cos(pitch) * math.cos(yaw)], dtype='f4')
-    eye = center + radius * direction
     right = np.cross([0, 1, 0], direction)
     right /= np.linalg.norm(right)
     up = np.cross(direction, right)
+    return right, up, direction
+
+
+def camera_matrix(center, radius, yaw, pitch, aspect):
+    right, up, direction = camera_axes(yaw, pitch)
+    eye = center + radius * direction
     view = np.eye(4, dtype='f4')
     view[:3, :3] = np.stack([right, up, direction])
     view[:3, 3] = -view[:3, :3] @ eye
@@ -135,7 +140,7 @@ class GLFWLoader:
 class Renderer:
     def __init__(self, body, cloth, body_faces, cloth_faces, width, height, vsync, *,
                  body_rest, body_weights, cloth_weights, require_hardware=True,
-                 ui=True, playback_speed=1.0):
+                 ui=True, playback_speed=1.0, motion=1.0):
         import glfw
         import moderngl
         self.glfw, self.gl = glfw, moderngl
@@ -145,6 +150,7 @@ class Renderer:
         self.ui = None
         self.fps = None
         self.playback_speed = playback_speed
+        self.motion = motion
         self.vsync = vsync
         self.normal_buffers = []
         self.frame_times = deque(maxlen=120)
@@ -218,6 +224,7 @@ class Renderer:
                 [(grid_buffer, '3f 3f', 'position', 'normal')])
             self.resources.extend([grid_buffer, self.grid])
             self.yaw, self.pitch = 0.0, 0.15
+            self.initial_camera = (self.center.copy(), self.radius, self.yaw, self.pitch)
             self.paused = self.single_step = self.restart = self.wireframe = False
             self.cursor = None
             if ui:
@@ -253,12 +260,37 @@ class Renderer:
             self.restart = True
         elif key == g.KEY_W:
             self.wireframe = not self.wireframe
+        elif key == g.KEY_F:
+            self.reset_camera()
+
+    def reset_camera(self):
+        center, self.radius, self.yaw, self.pitch = self.initial_camera
+        self.center = center.copy()
+        self.cursor = None
+
+    def pan_camera(self, dx, dy):
+        # Cursor coordinates use logical window pixels, also on HiDPI displays.
+        _, height = self.glfw.get_window_size(self.window)
+        if height < 1:
+            return
+        right, up, _ = camera_axes(self.yaw, self.pitch)
+        scale = 2 * self.radius * math.tan(math.radians(45) / 2) / height
+        self.center = (self.center + scale * (-dx * right + dy * up)).astype('f4')
 
     def _cursor(self, window, x, y):
-        if (self.cursor and not (self.ui and self.ui.captures_mouse)
-                and self.glfw.get_mouse_button(window, self.glfw.MOUSE_BUTTON_LEFT)):
-            self.yaw -= (x - self.cursor[0]) * 0.006
-            self.pitch = float(np.clip(self.pitch + (y - self.cursor[1]) * 0.006, -1.4, 1.4))
+        if self.cursor and not (self.ui and self.ui.captures_mouse):
+            g = self.glfw
+            left = g.get_mouse_button(window, g.MOUSE_BUTTON_LEFT) == g.PRESS
+            pan = (g.get_mouse_button(window, g.MOUSE_BUTTON_MIDDLE) == g.PRESS
+                   or g.get_mouse_button(window, g.MOUSE_BUTTON_RIGHT) == g.PRESS
+                   or (left and (g.get_key(window, g.KEY_LEFT_SHIFT) == g.PRESS
+                                 or g.get_key(window, g.KEY_RIGHT_SHIFT) == g.PRESS)))
+            dx, dy = x - self.cursor[0], y - self.cursor[1]
+            if pan:
+                self.pan_camera(dx, dy)
+            elif left:
+                self.yaw -= dx * 0.006
+                self.pitch = float(np.clip(self.pitch + dy * 0.006, -1.4, 1.4))
         self.cursor = (x, y)
 
     def _scroll(self, window, dx, dy):

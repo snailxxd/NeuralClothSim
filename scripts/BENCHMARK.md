@@ -5,7 +5,7 @@
 `viewer/` 为渲染报告和截图，`diagnostics/` 为诊断结果；目录内 README 标注最终结果。
 以下示例使用 `benchmarks/latest/`；需保留历史结果时改为对应日期。
 
-在项目根目录使用同一 checkpoint 比较原始三帧前处理、缓存历史和 XLA 融合路径：
+在项目根目录使用验证集最优权重比较原始三帧前处理、缓存历史和 XLA 融合路径：
 
 ```bash
 .venv/bin/python scripts/benchmark_inference.py \
@@ -71,7 +71,8 @@ with tf.device('/GPU:0'):
 默认 `--speed 1`：动画按真实时间原速播放，模型按训练配置
 `config.time_step` 运行，绘制不限帧，默认关闭垂直同步。模型更新率与显示 FPS 分开。
 直接加载测试动作和 checkpoint，无需 PC2 或预先生成整段衣物网格。
-`--checkpoint`、`--sequence-index` 可覆盖默认权重和动作。
+默认加载 `checkpoints/[实验名]/best.weights.h5`；`--checkpoint`、`--sequence-index`
+可覆盖默认权重和动作。
 
 固定步长只计算当前姿态，复用设备上的历史特征和 GRU 状态；每个模型步只运行一次网络。
 保留相邻两次未蒙皮衣物输出，OpenGL compute shader 在局部空间线性插值，再蒙皮。

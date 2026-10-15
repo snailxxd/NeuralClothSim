@@ -9,3 +9,8 @@ Northern Soul Spin.npz
 Stand To Roll.npz
 Walking Backwards.npz
 Ymca Dance.npz
+Thriller Part 2.npz
+Fast Run.npz
+Big Jump.npz
+Salsa Dancing.npz
+Falling To Roll.npz

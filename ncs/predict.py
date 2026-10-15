@@ -15,9 +15,18 @@ for gpu in gpus:
 
 
 def main(config, w=1.0):
-    # Load model
+    # Inference must use the validation-best weights, not the SavedModel that
+    # is overwritten at the end of every epoch.
+    checkpoint = os.path.join(CHECKPOINTS_DIR, config.name, "best.weights.h5")
+    if not os.path.isfile(checkpoint):
+        raise FileNotFoundError(
+            f"Best model weights not found: {checkpoint}. "
+            "Train the experiment with best-model checkpointing enabled first."
+        )
     model = NCS(config)
-    model.load_weights(os.path.join(CHECKPOINTS_DIR, config.name))
+    model.build(input_shape=config.input_shape)
+    model.load_weights(checkpoint)
+    print(f"Loaded best model: {checkpoint}")
 
     # Init data
     data = Data(config, mode="test")

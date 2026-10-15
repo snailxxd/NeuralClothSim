@@ -1,14 +1,14 @@
 """Geometry checks that run without a display or TensorFlow."""
 
 import unittest
-from unittest.mock import PropertyMock, patch
+from unittest.mock import Mock, PropertyMock, patch
 import os
 from types import SimpleNamespace
 
 import numpy as np
 
 from .realtime_renderer import Renderer, camera_matrix, normal_adjacency, is_software_renderer
-from .cli import save_report
+from .cli import save_report, validate_weight_restore
 from .playback import PlaybackClock, FixedStepPlayback, DisplaySkeleton, sample_interpolated_motion
 from .viewer_ui import PerformanceHistory
 
@@ -26,6 +26,16 @@ def reference_normals(vertices, faces):
 
 
 class PerformanceHistoryTests(unittest.TestCase):
+    def test_weight_restore_accepts_hdf5_and_validates_tensorflow_status(self):
+        validate_weight_restore(None)
+        status = SimpleNamespace(
+            assert_existing_objects_matched=Mock(),
+            expect_partial=Mock(),
+        )
+        validate_weight_restore(status)
+        status.assert_existing_objects_matched.assert_called_once_with()
+        status.expect_partial.assert_called_once_with()
+
     def test_report_counts_real_model_steps_and_flattens_timings(self):
         import contextlib
         import io
@@ -128,6 +138,66 @@ class PlaybackTests(unittest.TestCase):
         self.assertAlmostEqual(clock.tick(102, False, 2), 3.1)
 
 
+class CameraControlTests(unittest.TestCase):
+    def setUp(self):
+        self.buttons, self.keys = {}, {}
+        self.renderer = Renderer.__new__(Renderer)
+        self.renderer.glfw = SimpleNamespace(
+            PRESS=1, MOUSE_BUTTON_LEFT=0, MOUSE_BUTTON_RIGHT=1, MOUSE_BUTTON_MIDDLE=2,
+            KEY_LEFT_SHIFT=340, KEY_RIGHT_SHIFT=344,
+            get_mouse_button=lambda window, button: self.buttons.get(button, 0),
+            get_key=lambda window, key: self.keys.get(key, 0),
+            get_window_size=lambda window: (800, 600))
+        self.renderer.window = None
+        self.renderer.ui = None
+        self.renderer.center = np.array([0, 1, 0], dtype='f4')
+        self.renderer.radius = 5
+        self.renderer.yaw, self.renderer.pitch = 0.0, 0.15
+        self.renderer.cursor = (100, 100)
+        self.renderer.initial_camera = (self.renderer.center.copy(), 5, 0.0, 0.15)
+
+    def test_pan_follows_screen_drag_at_different_camera_angles(self):
+        renderer = self.renderer
+        for yaw, pitch in ((0, 0), (1.2, 0.7), (-2, -1.1)):
+            renderer.yaw, renderer.pitch = yaw, pitch
+            point = np.append(renderer.center.copy(), 1)
+            renderer.pan_camera(80, 60)
+            clip = camera_matrix(renderer.center, 5, yaw, pitch, 800 / 600) @ point
+            np.testing.assert_allclose(clip[:2] / clip[3], [0.2, -0.2], atol=1e-6)
+
+    def test_drag_modes_and_ui_capture(self):
+        renderer = self.renderer
+        for button, shift in ((2, False), (1, False), (0, True)):
+            renderer.reset_camera()
+            renderer.cursor = (100, 100)
+            self.buttons.clear()
+            self.keys.clear()
+            self.buttons[button] = 1
+            if shift:
+                self.keys[340] = 1
+            renderer._cursor(None, 120, 130)
+            self.assertFalse(np.array_equal(renderer.center, renderer.initial_camera[0]))
+            self.assertEqual((renderer.yaw, renderer.pitch), (0.0, 0.15))
+        renderer.ui = SimpleNamespace(captures_mouse=True)
+        center = renderer.center.copy()
+        renderer._cursor(None, 150, 160)
+        np.testing.assert_array_equal(renderer.center, center)
+        renderer.ui = None
+        self.keys.clear()
+        renderer._cursor(None, 170, 180)
+        self.assertNotEqual(renderer.yaw, 0)
+        np.testing.assert_array_equal(renderer.center, center)
+
+    def test_reset_restores_initial_view(self):
+        renderer = self.renderer
+        renderer.pan_camera(100, 100)
+        renderer.radius, renderer.yaw, renderer.pitch = 10, 1, 1
+        renderer.reset_camera()
+        np.testing.assert_array_equal(renderer.center, renderer.initial_camera[0])
+        self.assertEqual((renderer.radius, renderer.yaw, renderer.pitch), (5, 0, 0.15))
+        self.assertIsNone(renderer.cursor)
+
+
 class GeometryTests(unittest.TestCase):
     def test_display_fk_preserves_bone_length_during_rotation(self):
         local = np.tile(np.eye(4, dtype='f4'), (2, 1, 1))
@@ -168,6 +238,37 @@ class GeometryTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('NCS_TEST_TENSORFLOW') == '1', 'Optional TensorFlow feature test')
 class LocalOutputTests(unittest.TestCase):
+    def test_motion_updates_traced_network_without_changing_recurrence(self):
+        import sys
+        from pathlib import Path
+        import tensorflow as tf
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ncs'))
+        from model.streaming import StreamingNCS
+        gru = tf.keras.layers.GRU(3, use_bias=False)
+        gru.build((1, 1, 12))
+        gru.set_weights([np.full(weight.shape, 0.1, dtype='f4') for weight in gru.get_weights()])
+        model = SimpleNamespace(body=SimpleNamespace(num_input_joints=1),
+                                static_encoder=[lambda x: tf.reshape(x[..., :3], [1, 1, 3])],
+                                dynamic_encoder=[lambda x: tf.reshape(x, [1, 1, 12]), gru],
+                                decoder=[])
+        stream = StreamingNCS(model)
+        features = tf.ones([1, 1, 1, 21])
+        hidden = tf.zeros([1, 3])
+        for compiled in (False, True):
+            network = (tf.function(stream.network_step.python_function, jit_compile=True)
+                       if compiled else stream.network_step)
+            stream.motion.assign(1.0)
+            baseline, state = network(features, hidden)
+            traces = network.experimental_get_tracing_count()
+            for motion in (0.0, 0.5, 2.0, 1.0):
+                stream.motion.assign(motion)
+                output, current_state = network(features, hidden)
+                np.testing.assert_allclose(output.numpy(), 1 + motion * (baseline.numpy() - 1),
+                                           rtol=1e-5, atol=1e-6)
+                np.testing.assert_array_equal(current_state.numpy(), state.numpy())
+                self.assertEqual(network.experimental_get_tracing_count(), traces)
+            self.assertGreater(float(tf.norm(state)), 0)
+
     def test_local_api_preserves_fixed_step_state_and_world_output(self):
         import sys
         from pathlib import Path
@@ -275,6 +376,13 @@ class OpenGLTests(unittest.TestCase):
                 renderer.begin_ui()
                 self.assertTrue(renderer.paused)
                 self.assertEqual(renderer.playback_speed, 2.0)
+                self.assertEqual(renderer.motion, 2.0)
+                renderer.draw()
+            renderer.swap()
+            with patch.object(renderer.ui.imgui, 'button',
+                              side_effect=lambda label: label == 'Reset motion (1.0)'):
+                renderer.begin_ui()
+                self.assertEqual(renderer.motion, 1.0)
                 renderer.draw()
         finally:
             renderer.close()

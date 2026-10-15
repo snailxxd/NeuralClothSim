@@ -2,3 +2,6 @@ Fast Run.npz
 Big Jump.npz
 Salsa Dancing.npz
 Falling To Roll.npz
+Thriller Part 2.npz
+Jump.npz
+Breathing Idle.npz

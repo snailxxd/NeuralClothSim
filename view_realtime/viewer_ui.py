@@ -116,6 +116,14 @@ class ViewerUI:
             owner.playback_speed = speed
         if ui.button('Reset speed (1x)'):
             owner.playback_speed = 1.0
+        changed, motion = ui.slider_float('Motion', owner.motion, 0.0, 2.0, '%.2f')
+        if changed:
+            owner.motion = motion
+        if ui.button('Reset motion (1.0)'):
+            owner.motion = 1.0
+        ui.text_disabled('Dynamic cloth strength; applies on the next model tick.')
+        if ui.button('Reset camera (F)'):
+            owner.reset_camera()
         ui.text(f'Animation: {self.state.get("animation_time", 0):.2f} s')
         ui.text(f'Model step: {self.state.get("model_fps", 0):g} Hz (fixed)')
         ui.text(f'Display delay: {self.state.get("display_delay_ms", 0):.1f} animation ms')
@@ -158,7 +166,8 @@ class ViewerUI:
         ui.text_disabled('Serial estimate excludes rendering / scheduling.')
         ui.separator()
         ui.text_wrapped(owner.ctx.info.get('GL_RENDERER', 'Unknown GPU'))
-        ui.text_disabled('Drag outside panel: orbit | Wheel: zoom')
+        ui.text_disabled('Left drag: orbit | Wheel: zoom')
+        ui.text_disabled('Middle / right / Shift+left drag: pan | F: reset view')
         ui.end()
 
     def render(self):

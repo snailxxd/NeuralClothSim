@@ -30,7 +30,7 @@ def parse_args():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path,
-                        help="Checkpoint directory/prefix; default: checkpoints/<config name>")
+                        help="Weights to load; defaults to the validation-best weights")
     parser.add_argument("--gpu-id", default="0", help="Physical CUDA GPU ID (default: 0)")
     parser.add_argument("--device", choices=("gpu", "cpu"), default="gpu",
                         help="CPU is an explicit fallback for validation only")
@@ -88,7 +88,7 @@ def main():
     device = "/GPU:0" if args.device == "gpu" else "/CPU:0"
     config = MainConfig(str(args.config.resolve()))
     checkpoint = (args.checkpoint.resolve() if args.checkpoint else
-                  Path(CHECKPOINTS_DIR) / config.name)
+                  Path(CHECKPOINTS_DIR) / config.name / "best.weights.h5")
     if not checkpoint.exists() and not Path(str(checkpoint) + ".index").exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
@@ -107,8 +107,11 @@ def main():
         model = NCS(config)
         model.build(config.input_shape)
         status = model.load_weights(str(checkpoint))
-        status.assert_existing_objects_matched()
-        status.expect_partial()  # Training-only optimizer slots are unused.
+        # HDF5 weight files return None; TensorFlow checkpoints return a
+        # status object that can verify the model variables were restored.
+        if status is not None:
+            status.assert_existing_objects_matched()
+            status.expect_partial()  # Training-only optimizer slots are unused.
         network_layers = model.static_encoder + model.dynamic_encoder + model.decoder
         if args.device == "gpu":
             misplaced = [v.name for layer in network_layers for v in layer.weights

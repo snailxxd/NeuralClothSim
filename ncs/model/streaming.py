@@ -16,7 +16,8 @@ class StreamingNCS(tf.Module):
     def __init__(self, model, motion=1.0, batch_size=1):
         super().__init__()
         self.model = model
-        self.motion = motion
+        # Read at execution time, including inside traced/XLA inference graphs.
+        self.motion = tf.Variable(motion, dtype=tf.float32, trainable=False, name="motion")
         joints = model.body.num_input_joints
         self.previous_x = tf.Variable(tf.zeros([batch_size, 1, joints, 9]), trainable=False)
         self.previous_j = tf.Variable(tf.zeros([batch_size, 1, joints, 3]), trainable=False)
