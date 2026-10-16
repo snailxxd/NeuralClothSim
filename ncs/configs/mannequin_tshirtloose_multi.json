@@ -2,7 +2,7 @@
     "experiment": {
         "epochs": 500,
         "batch_size": 64,
-        "learning_rate": 0.0015,
+        "learning_rate": 0.0003,
         "temporal_window_size": 1,
         "reflect_probability": 0.5,
         "motion_augmentation": 0.2,

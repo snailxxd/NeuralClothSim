@@ -31,8 +31,11 @@ def validate_weight_restore(status):
 def parse_args():
     parser = argparse.ArgumentParser(prog='python -m view_realtime', description=__doc__)
     parser.add_argument('--config', type=Path, default=ROOT / 'ncs/configs/test.json')
-    parser.add_argument('--checkpoint', type=Path,
-                        help='Weights to load; defaults to the validation-best weights')
+    weights = parser.add_mutually_exclusive_group()
+    weights.add_argument('--checkpoint', type=Path,
+                         help='Explicit weights path; overrides the default selection')
+    weights.add_argument('--weights', choices=['best', 'latest'], default='best',
+                         help='Model weights to use for inference (default: best)')
     parser.add_argument('--gpu-id', default='0')
     parser.add_argument('--device', choices=['gpu', 'cpu'], default='gpu')
     parser.add_argument('--sequence-index', type=int, default=0)
@@ -191,10 +194,11 @@ def main():
     import numpy as np
     import tensorflow as tf
     from dataset.sequence import PoseSequence
-    from global_vars import CHECKPOINTS_DIR, DATA_DIR, TXT_DIR
+    from global_vars import DATA_DIR, TXT_DIR
     from model.ncs import NCS
     from model.streaming import StreamingNCS
     from utils.config import MainConfig
+    from utils.inference_checkpoint import inference_checkpoint
 
     tf.config.experimental.enable_tensor_float_32_execution(False)
     gpus = tf.config.list_physical_devices('GPU')
@@ -204,7 +208,7 @@ def main():
         tf.config.experimental.set_memory_growth(gpu, True)
     config = MainConfig(str(args.config.resolve()))
     checkpoint = (args.checkpoint.resolve() if args.checkpoint else
-                  Path(CHECKPOINTS_DIR) / config.name / 'best.weights.h5')
+                  inference_checkpoint(config.name, args.weights))
     if not checkpoint.exists() and not Path(str(checkpoint) + '.index').exists():
         raise FileNotFoundError(f'Checkpoint not found: {checkpoint}')
     names = [line.strip() for line in (Path(TXT_DIR) / config.data.dataset /

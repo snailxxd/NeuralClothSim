@@ -71,8 +71,8 @@ with tf.device('/GPU:0'):
 默认 `--speed 1`：动画按真实时间原速播放，模型按训练配置
 `config.time_step` 运行，绘制不限帧，默认关闭垂直同步。模型更新率与显示 FPS 分开。
 直接加载测试动作和 checkpoint，无需 PC2 或预先生成整段衣物网格。
-默认加载 `checkpoints/[实验名]/best.weights.h5`；`--checkpoint`、`--sequence-index`
-可覆盖默认权重和动作。
+默认加载 `checkpoints/[实验名]/best.weights.h5`；使用 `--weights latest` 可选择
+最后一轮模型，`--checkpoint` 可显式指定其他权重，`--sequence-index` 可选择动作。
 
 固定步长只计算当前姿态，复用设备上的历史特征和 GRU 状态；每个模型步只运行一次网络。
 保留相邻两次未蒙皮衣物输出，OpenGL compute shader 在局部空间线性插值，再蒙皮。

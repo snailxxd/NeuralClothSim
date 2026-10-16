@@ -29,9 +29,10 @@ class FullyConnected(Layer):
             )
 
     def call(self, x):
-        x = tf.expand_dims(x, axis=-2)
-        x = x @ self.kernel
-        x = x[..., 0, :]
+        # Contract the feature axis with one matrix multiplication. Broadcasting
+        # a kernel over batch/time/joints materializes a kernel-sized gradient
+        # for every sample before reducing it, which can exhaust GPU memory.
+        x = tf.tensordot(x, self.kernel, axes=[[-1], [0]])
         if self.use_bias:
             x += self.bias
         x = self.act(x)
@@ -43,8 +44,16 @@ class SkelFlatten(Layer):
         super().__init__(trainable=False, **kwargs)
 
     def call(self, inputs):
-        input_shape = tf_shape(inputs)
-        return tf.reshape(inputs, (*input_shape[:-2], tf.reduce_prod(input_shape[-2:])))
+        # Batch and time can both be unknown in a generalized tf.function.
+        # Use runtime sizes instead of multiple inferred (-1) dimensions.
+        input_shape = tf.shape(inputs)
+        outputs = tf.reshape(
+            inputs,
+            tf.concat((input_shape[:-2], [tf.reduce_prod(input_shape[-2:])]), axis=0),
+        )
+        # Keep the feature width available to downstream weight-building layers.
+        outputs.set_shape(inputs.shape[:-2].concatenate(inputs.shape[-2:].num_elements()))
+        return outputs
 
 
 class PSD(Layer):

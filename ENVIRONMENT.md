@@ -29,6 +29,18 @@ python train.py --config configs/smpl.json --gpu_id 0
 
 默认每个 epoch 输出一次指标，省略模型结构表和已知重复警告；如需详细 TensorFlow 日志、模型结构和 batch 进度，在训练命令末尾加 `--verbose`。TensorFlow 原生错误日志仍会显示。优化器关闭 XLA 编译，以避免当前 eager 训练流程中反复追踪不同形状参数的更新。
 
+动态编码器使用可复用的 `tf.function` 计算图：本机 TensorFlow 2.15.1 的无偏置 GRU 在 eager 模式下每次前向计算会持续保留约 512 KiB GPU 内存，训练和验证都会累积。碰撞检测仍在 eager 模式下调用 SciPy。全连接层通过 `tensordot` 收缩特征维，避免广播矩阵乘法在反向传播时生成逐样本的权重梯度临时张量。模型参数结构和 checkpoint 路径不变，已有训练进程需要重启才能应用修复。
+
+数值与显存回归检查（在项目根目录运行；GPU 检查使用临时目录，不覆盖已有实验）：
+
+```bash
+.venv/bin/python scripts/test_training_memory.py
+NCS_TEST_GPU=1 .venv/bin/python scripts/test_training_memory.py
+.venv/bin/python scripts/test_training_restart.py
+```
+
+GPU 检查运行 dress 模型的 24 轮短训练，包含验证、TensorBoard、恢复 checkpoint、最佳权重和完整模型保存，并检查预热后的实际分配显存是否稳定。
+
 中断后继续训练时，可复制配置为新的文件名，在 `experiment` 中设置 `checkpoint` 为旧实验名、`initial_epoch` 为 checkpoint 已完成的轮数。训练会恢复模型与 Adam 优化器状态；例如 `initial_epoch: 207`、`epochs: 5000` 会从第 208 轮继续到第 5000 轮，新结果保存在新配置文件名对应的目录中。日志可能先于 checkpoint 写入，应以实际保存状态为准。
 
 `train.py` 默认在独立子进程中训练。遇到 GPU OOM 时，子进程退出以释放显存，外层进程自动启动新的训练进程，从最后成功保存的轮数继续。每轮验证结束后，先在 `checkpoints/[实验名]/recovery/` 保存模型、Adam 状态和 `state.json`，再导出原有 SavedModel；恢复记录只在 checkpoint 写入成功后提交，因此不会把尚未保存的轮数当成完成。保留最近两份恢复 checkpoint，增加约两份 checkpoint 的磁盘占用。普通错误和 Ctrl-C 不会触发自动重启。
@@ -43,7 +55,7 @@ python train.py --config configs/smpl.json --gpu_id 0
 .venv/bin/python -m view_realtime --config ncs/configs/mannequin_dress_multi.json
 ```
 
-`predict.py` 和实时查看器默认都加载 `checkpoints/[实验名]/best.weights.h5`；实时查看器仍可用 `--checkpoint` 显式指定其他权重。最佳轮数和 Loss 可通过 `h5py.File` 读取文件属性 `ncs_best_epoch` 和 `ncs_best_val_loss`。已有训练进程需要重新启动才能启用最佳模型保存。
+`predict.py`、实时查看器和性能基准默认都加载 `checkpoints/[实验名]/best.weights.h5`；添加 `--weights latest` 可改用最后一轮模型。实时查看器和性能基准仍可用 `--checkpoint` 显式指定其他权重。最佳轮数和 Loss 可通过 `h5py.File` 读取文件属性 `ncs_best_epoch` 和 `ncs_best_val_loss`。已有训练进程需要重新启动才能启用最佳模型保存。
 
 训练完成后，使用对应配置和生成的 checkpoint 预测：
 

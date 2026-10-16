@@ -291,8 +291,7 @@ class NCS(tf.keras.Model):
         for l in self.static_encoder:
             x_static = l(x_static)
         # Dynamic encoder
-        for l in self.dynamic_encoder:
-            x_dynamic = l(x_dynamic)
+        x_dynamic = self.encode_dynamic(x_dynamic, training=training)
         if not predict:
             x_dynamic = x_dynamic[:, -3:]
         if training and self.config.motion_augmentation:
@@ -304,6 +303,15 @@ class NCS(tf.keras.Model):
         for l in self.decoder:
             x = l(x)
 
+        return x
+
+    @tf.function(reduce_retracing=True)
+    def encode_dynamic(self, x, training=False):
+        # The bias-free GRU uses Keras' generic RNN implementation. In TF 2.15
+        # its eager loop retains GPU buffers on every call. Reuse a graph for
+        # the encoder while keeping SciPy collision detection in eager mode.
+        for layer in self.dynamic_encoder:
+            x = layer(x, training=training)
         return x
 
     def motion_augmentation(self, x_static, x_dynamic):

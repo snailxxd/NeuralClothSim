@@ -6,27 +6,25 @@ import tensorflow as tf
 from dataset.data import Data
 from model.ncs import NCS
 from utils.config import MainConfig
+from utils.inference_checkpoint import inference_checkpoint
 from utils.IO import writePC2Frames
-from global_vars import CHECKPOINTS_DIR, RESULTS_DIR
+from global_vars import RESULTS_DIR
 
 gpus = tf.config.experimental.list_physical_devices("GPU")
 for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
 
 
-def main(config, w=1.0):
-    # Inference must use the validation-best weights, not the SavedModel that
-    # is overwritten at the end of every epoch.
-    checkpoint = os.path.join(CHECKPOINTS_DIR, config.name, "best.weights.h5")
-    if not os.path.isfile(checkpoint):
+def main(config, w=1.0, weights="best"):
+    checkpoint = inference_checkpoint(config.name, weights)
+    if not checkpoint.exists():
         raise FileNotFoundError(
-            f"Best model weights not found: {checkpoint}. "
-            "Train the experiment with best-model checkpointing enabled first."
+            f"Selected {weights} model weights not found: {checkpoint}"
         )
     model = NCS(config)
     model.build(input_shape=config.input_shape)
-    model.load_weights(checkpoint)
-    print(f"Loaded best model: {checkpoint}")
+    model.load_weights(str(checkpoint))
+    print(f"Loaded {weights} model: {checkpoint}")
 
     # Init data
     data = Data(config, mode="test")
@@ -68,6 +66,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--gpu_id", type=str, default="")
     parser.add_argument("--motion", type=float, default=1.0)
+    parser.add_argument("--weights", choices=("best", "latest"), default="best",
+                        help="Model weights to use for inference (default: best)")
     opts = parser.parse_args()
 
     # Set GPU
@@ -83,4 +83,4 @@ if __name__ == "__main__":
         sys.exit()
 
     config = MainConfig(opts.config)
-    main(config, w=opts.motion)
+    main(config, w=opts.motion, weights=opts.weights)

@@ -29,8 +29,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path,
-                        help="Weights to load; defaults to the validation-best weights")
+    weights = parser.add_mutually_exclusive_group()
+    weights.add_argument("--checkpoint", type=Path,
+                         help="Explicit weights path; overrides the default selection")
+    weights.add_argument("--weights", choices=("best", "latest"), default="best",
+                         help="Model weights to use for inference (default: best)")
     parser.add_argument("--gpu-id", default="0", help="Physical CUDA GPU ID (default: 0)")
     parser.add_argument("--device", choices=("gpu", "cpu"), default="gpu",
                         help="CPU is an explicit fallback for validation only")
@@ -70,10 +73,11 @@ def main():
     import numpy as np
     import tensorflow as tf
     from dataset.sequence import PoseSequence
-    from global_vars import CHECKPOINTS_DIR, DATA_DIR, TXT_DIR
+    from global_vars import DATA_DIR, TXT_DIR
     from model.ncs import NCS
     from model.streaming import StreamingNCS
     from utils.config import MainConfig
+    from utils.inference_checkpoint import inference_checkpoint
 
     # Float32 tensors can otherwise use reduced-precision TF32 matmuls on
     # supported GPUs. Batched and three-frame FK may select different kernels;
@@ -88,7 +92,7 @@ def main():
     device = "/GPU:0" if args.device == "gpu" else "/CPU:0"
     config = MainConfig(str(args.config.resolve()))
     checkpoint = (args.checkpoint.resolve() if args.checkpoint else
-                  Path(CHECKPOINTS_DIR) / config.name / "best.weights.h5")
+                  inference_checkpoint(config.name, args.weights))
     if not checkpoint.exists() and not Path(str(checkpoint) + ".index").exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
