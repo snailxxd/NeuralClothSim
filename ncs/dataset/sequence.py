@@ -10,6 +10,16 @@ class PoseSequence:
             self.trans = data["trans"].astype(np.float32)
             self.fps = data["fps"]
             self.source = data["source"]
+        if self.poses.ndim != 3 or self.poses.shape[-1] not in (3, 4):
+            raise ValueError(f"{npz_file}: expected poses (T, joints, 3 or 4)")
+        if len(self.poses) < 2 or self.trans.shape != (len(self.poses), 3):
+            raise ValueError(f"{npz_file}: need at least two frames and matching translations")
+        if np.size(self.fps) != 1 or not np.isfinite(self.fps).all() or float(self.fps) <= 0:
+            raise ValueError(f"{npz_file}: invalid fps")
+        if not np.isfinite(self.poses).all() or not np.isfinite(self.trans).all():
+            raise ValueError(f"{npz_file}: non-finite motion data")
+        if self.poses.shape[-1] == 4 and np.any(np.linalg.norm(self.poses, axis=-1) < 1e-6):
+            raise ValueError(f"{npz_file}: zero quaternion")
         if self.poses.shape[-1] == 3:
             self.poses = axis_angle_to_quat(self.poses)
 

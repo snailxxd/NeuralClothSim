@@ -16,6 +16,8 @@
 
 Environment setup (Linux / WSL2): [ENVIRONMENT.md](ENVIRONMENT.md).
 
+AMASS CMU SMPL+H data preparation and server training: [SMPL_CMU.md](scripts/SMPL_CMU.md).
+
 ### Train
 
 To train a model go to `ncs/` and run:

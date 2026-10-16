@@ -7,3 +7,4 @@ checkpoints/
 results/
 benchmarks/
 tmp/
+data/amass_cmu/

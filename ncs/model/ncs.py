@@ -80,6 +80,13 @@ class NCS(tf.keras.Model):
     def build_losses_and_metrics(self):
         # Losses and Metrics
         self.loss_metric = MyMetric(name="Loss")
+        # Epoch metrics reset on fit; keep new counters outside recovery state
+        # so checkpoints created before these metrics can still be restored.
+        self.static_loss_metric = self._no_dependency(MyMetric(name="StaticLoss"))
+        self.inertia_loss_metric = self._no_dependency(MyMetric(name="InertiaLoss"))
+        self.component_metrics = self._no_dependency({
+            name: MyMetric(name=name) for name in ("ClothLoss", "BendingLoss", "CollisionLoss", "PinningLoss")
+        })
         # Cloth model
         if self.config.cloth_model == "mass-spring":
             self.cloth_loss = EdgeLoss(self.garment)
@@ -124,9 +131,12 @@ class NCS(tf.keras.Model):
 
     def compute_losses_and_metrics(self, body, vertices, unskinned, training):
         loss = self.compute_static_losses_and_metrics(body, vertices[:, -1], unskinned)
+        batch_size = tf.shape(vertices)[0]
         if training and self.config.motion_augmentation:
-            vertices = vertices[self.config.motion_augmentation :]
+            vertices = vertices[self.augmentation_count(batch_size) :]
         loss += self.compute_dynamic_losses_and_metrics(vertices)
+        tf.debugging.assert_all_finite(loss, "Non-finite total loss; training stopped")
+        self.loss_metric.update_state(loss, batch_size)
         return loss
 
     def compute_static_losses_and_metrics(self, body, vertices, unskinned):
@@ -166,22 +176,29 @@ class NCS(tf.keras.Model):
         if self.garment.pinning:
             loss += self.config.loss.pinning * pinning_loss
         # Update metrics
-        self.loss_metric.update_state(loss)
+        batch_size = tf.shape(vertices)[0]
+        for name, value in (("ClothLoss", cloth_loss),
+                            ("BendingLoss", self.config.loss.bending * bending_loss),
+                            ("CollisionLoss", self.config.loss.collision_weight * collision_loss),
+                            ("PinningLoss", self.config.loss.pinning * pinning_loss if self.garment.pinning else 0.0)):
+            self.component_metrics[name].update_state(value, batch_size)
+        self.static_loss_metric.update_state(loss, batch_size)
         if self.config.cloth_model == "mass-spring":
-            self.edge_metric.update_state(edge_error)
+            self.edge_metric.update_state(edge_error, batch_size)
         elif self.config.cloth_model == "baraff98":
-            self.stretch_metric.update_state(stretch_error)
-            self.shear_metric.update_state(shear_error)
+            self.stretch_metric.update_state(stretch_error, batch_size)
+            self.shear_metric.update_state(shear_error, batch_size)
         elif self.config.cloth_model == "stvk":
-            self.strain_metric.update_state(strain_error)
-        self.bending_metric.update_state(bending_error)
-        self.collision_metric.update_state(collision_error)
-        self.gravity_metric.update_state(gravitational_potential)
+            self.strain_metric.update_state(strain_error, batch_size)
+        self.bending_metric.update_state(bending_error, batch_size)
+        self.collision_metric.update_state(collision_error, batch_size)
+        self.gravity_metric.update_state(gravitational_potential, batch_size)
         return loss
 
     def compute_dynamic_losses_and_metrics(self, vertices):
         inertia_loss, inertia_error = self.inertia_loss(vertices)
-        self.inertia_metric.update_state(inertia_error)
+        self.inertia_metric.update_state(inertia_error, tf.shape(vertices)[0])
+        self.inertia_loss_metric.update_state(inertia_loss, tf.shape(vertices)[0])
         return inertia_loss
 
     def train_step(self, inputs):
@@ -191,6 +208,11 @@ class NCS(tf.keras.Model):
                 body, vertices, unskinned, training=True
             )
         gradients = tape.gradient(loss, self.trainable_variables)
+        for gradient, variable in zip(gradients, self.trainable_variables):
+            if gradient is None:
+                raise ValueError(f"Missing gradient for {variable.name}")
+            values = gradient.values if isinstance(gradient, tf.IndexedSlices) else gradient
+            tf.debugging.assert_all_finite(values, f"Non-finite gradient for {variable.name}")
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         return {m.name: m.result() for m in self.metrics}
 
@@ -209,6 +231,9 @@ class NCS(tf.keras.Model):
             cloth_metrics = [self.strain_metric]
         return [
             self.loss_metric,
+            self.static_loss_metric,
+            self.inertia_loss_metric,
+            *self.component_metrics.values(),
             *cloth_metrics,
             self.bending_metric,
             self.collision_metric,
@@ -314,9 +339,13 @@ class NCS(tf.keras.Model):
             x = layer(x, training=training)
         return x
 
+    def augmentation_count(self, batch_size):
+        # A short final batch must retain at least one physical-motion sample.
+        return tf.minimum(self.config.motion_augmentation, tf.maximum(0, batch_size - 1))
+
     def motion_augmentation(self, x_static, x_dynamic):
         batch_size = tf.shape(x_static)[0]
-        n = self.config.motion_augmentation
+        n = self.augmentation_count(batch_size)
         splits = [n, tf.maximum(0, batch_size - n)]
         x_static_aug, x_static = tf.split(x_static, splits)
         x_dynamic_aug, x_dynamic = tf.split(x_dynamic, splits)

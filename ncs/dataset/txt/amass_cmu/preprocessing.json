@@ -1,0 +1,11 @@
+{
+  "source": "/mnt/d/Work/amass/CMU",
+  "source_up_axis": "z",
+  "target_fps": 30,
+  "seed": 42,
+  "frames": 993443,
+  "duration_seconds": 33045.366666666705,
+  "split_unit": "subject_directory",
+  "smpl_terminal_hands": "zero",
+  "shape": "fixed bundled body; betas/dmpls ignored"
+}

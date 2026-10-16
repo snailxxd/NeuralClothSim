@@ -6,7 +6,7 @@
         "temporal_window_size": 0.5,
         "reflect_probability": 0.0,
         "motion_augmentation": 0.0,
-        "checkpoint": null
+        "checkpoint": "smpl"
     },
     "body": {
         "model": "smpl_female_neutral",
@@ -14,7 +14,7 @@
         "input_joints": [0, 1, 2, 3, 4, 5, 6, 9, 12, 13, 14, 16, 17, 18, 19]
     },
     "garment": {
-        "name": "tshirt",
+        "name": "dress",
         "blend_weights_smoothing_iterations": 10
     },
     "data": {

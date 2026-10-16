@@ -6,7 +6,7 @@ from math import ceil
 
 from tensorflow.keras.utils import Sequence
 
-from global_vars import DATA_DIR, TXT_DIR, BODY_DIR
+from global_vars import DATA_DIR, TXT_DIR, BODY_DIR, NUM_JOINTS
 from dataset.sequence import PoseSequence
 
 
@@ -33,14 +33,19 @@ class Data(Sequence):
     # Read names of sequence files from a txt
     def read_txt(self):
         with open(self.txt, "r") as f:
-            self.sequences = [
-                os.path.join(DATA_DIR, self.config.data.dataset, line.replace("\n", ""))
-                for line in f.readlines()
-            ]
+            names = [line.strip() for line in f if line.strip()]
+        if not names:
+            raise ValueError(f"Empty sequence list: {self.txt}")
+        if len(names) != len(set(names)):
+            raise ValueError(f"Duplicate sequence names in {self.txt}")
+        self.sequences = [os.path.join(DATA_DIR, self.config.data.dataset, name) for name in names]
 
     # Loads the sequence data into PoseSequence objects (See 'sequence.py')
     def read_sequences(self):
         self.sequences = [PoseSequence(seq) for seq in self.sequences]
+        expected = NUM_JOINTS[self.config.body.skeleton]
+        if any(seq.num_joints != expected for seq in self.sequences):
+            raise ValueError(f"{self.txt}: motion joint count does not match {self.config.body.skeleton}")
         self.seq_idx = np.array(range(self.num_sequences))
         self.seq_duration = np.array([seq.duration for seq in self.sequences])
         self.seq_prob = self.seq_duration / self.seq_duration.sum()

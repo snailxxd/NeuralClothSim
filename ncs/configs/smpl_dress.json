@@ -1,0 +1,39 @@
+{
+    "experiment": {
+        "epochs": 10,
+        "batch_size": 16,
+        "learning_rate": 0.001,
+        "temporal_window_size": 0.5,
+        "reflect_probability": 0.0,
+        "motion_augmentation": 0.0,
+        "checkpoint": null
+    },
+    "body": {
+        "model": "smpl_female_neutral",
+        "skeleton": "smpl",
+        "input_joints": [0, 1, 2, 3, 4, 5, 6, 9, 12, 13, 14, 16, 17, 18, 19]
+    },
+    "garment": {
+        "name": "dress",
+        "blend_weights_smoothing_iterations": 10
+    },
+    "data": {
+        "dataset": "amass_cmu",
+        "train": "train.txt",
+        "validation": "val.txt",
+        "test": "test.txt",
+        "fps": 30
+    },
+    "model": {
+        "blend_weights_optimize": false
+    },
+    "loss": {
+        "cloth": {"type": "baraff98", "stretch": 10.0, "shear": 1.0},
+        "bending": 0.00002,
+        "collision_weight": 10.0,
+        "collision_threshold": 0.004,
+        "density": 0.15,
+        "pinning": 100.0,
+        "gravity": "-Y"
+    }
+}

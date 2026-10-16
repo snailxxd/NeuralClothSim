@@ -135,14 +135,9 @@ class Collision(Layer):
             )
         return tf.stack([self.run_sample(elem) for elem in zip(vertices, collider)])
 
-    def build(self, input_shape):
-        batch_size, num_verts = input_shape[:2]
-        self.idx = tf.tile(tf.range(batch_size)[:, None], [1, num_verts])
-
     def call(self, vertices, collider):
         batch_size = tf.shape(vertices)[0]
         idx = self.run(vertices, tf.gather(collider, self.collision_vertices, axis=-2))
-        idx = tf.stack(
-            [tf.gather(self.idx, tf.range(batch_size), axis=0), idx], axis=-1
-        )
+        batch_indices = tf.broadcast_to(tf.range(batch_size, dtype=idx.dtype)[:, None], tf.shape(idx))
+        idx = tf.stack([batch_indices, idx], axis=-1)
         return idx
